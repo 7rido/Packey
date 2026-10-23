@@ -1363,8 +1363,12 @@ _CARRIER_PAGES = {
         # number whose page rendered nothing.
         "prefer": "page",
         # 0 = a fired window that carried no data ends the attempt (the 47s
-        # no-data path measured 2026-09-24). FedEx keeps the default of 1, where
-        # one more chance matters because its spy is the ONLY signal.
+        # no-data path measured 2026-09-24). (FedEx no longer retries in a
+        # session at all: max_attempts=1, see its cfg.)
+        # UNVERIFIED SUSPICION (2026-10-22): FedEx's app only fires its API on
+        # the first load in a fresh profile, and this spy re-navigates in the
+        # SAME session — the 6/6-then-1/3 decay above fits that pattern. Run a
+        # fedex_spy-style A/B on a live UPS number before trusting this path.
         "empty_retries": 0,
         "json_watch": {
             "api_match": lambda r: ("webapis.ups.com/track/api/Track/GetStatus"
