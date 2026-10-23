@@ -28,6 +28,10 @@ os.chdir(ROOT)
 import usps_browser as ub  # noqa: E402
 
 ub._PROFILE_COPY = os.path.expanduser("~/Library/Caches/carrier_smoke_profile")
+# Save the (redacted, owner-only) page text of any empty result, so a FAIL or
+# WARN can be read instead of guessed at. dbg/ is gitignored.
+CAPTURE_DIR = os.path.join(ROOT, "dbg", "smoke")
+ub.USPS_DEBUG_DIR = ub.USPS_DEBUG_DIR or CAPTURE_DIR
 
 # Placeholders. FedEx's public test number returns real shipment data, so it is
 # a full check; the others are format-valid fakes (page-load check only).
@@ -108,8 +112,10 @@ def main():
     for item in args.number:
         slug, _, tid = item.partition("=")
         plan[slug.strip().lower()] = (tid.strip(), True)
-    slugs = [s for s in ("usps", "ups", "fedex", "dhl")
-             if s in ub.browser_slugs() and (not args.carrier or s in args.carrier)]
+    wanted = [s for s in ("usps", "ups", "fedex", "dhl")
+              if not args.carrier or s in args.carrier]
+    slugs = [s for s in wanted if s in ub.browser_slugs()]
+    skipped = [s for s in wanted if s not in slugs]
 
     cap = _Capture()
     log = logging.getLogger("tracker")
@@ -135,6 +141,15 @@ def main():
             v, why = verdict(slug, tid, real, res, outcome, cap.lines, secs)
             rows.append((v, ub.page_label(slug), ub._mask(tid), kind, secs, why))
             print(f"         {v}  {secs:4.0f}s  {why}", flush=True)
+            if v != "PASS":
+                caps = sorted((f for f in os.listdir(ub.USPS_DEBUG_DIR)
+                               if f.startswith(slug + "-")),
+                              key=lambda f: os.path.getmtime(
+                                  os.path.join(ub.USPS_DEBUG_DIR, f)))  \
+                    if os.path.isdir(ub.USPS_DEBUG_DIR) else []
+                if caps:
+                    print(f"         page text saved: "
+                          f"{os.path.relpath(os.path.join(ub.USPS_DEBUG_DIR, caps[-1]), ROOT)}")
     finally:
         log.removeHandler(cap)
         ub.cleanup_profile_copy()
@@ -142,6 +157,9 @@ def main():
     print("\nSUMMARY")
     for v, label, tid, kind, secs, why in rows:
         print(f"  {v:4}  {label:6} {tid:14} {kind:11} {secs:4.0f}s  {why}")
+    for slug in skipped:
+        print(f"  SKIP  {ub.page_label(slug):6} — browser tier disabled "
+              f"(USPS_BROWSER_DISABLED_SLUGS in .env)")
     fails = sum(1 for r in rows if r[0] == "FAIL")
     print(f"\n{len(rows)} carrier(s): {len(rows) - fails} ok/warn, {fails} fail")
     sys.exit(1 if fails else 0)
