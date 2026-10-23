@@ -92,7 +92,13 @@ def verdict(slug, tid, real, res, outcome, lines, secs):
             return "FAIL", "API answered but the parser read nothing (see log)"
         return "FAIL", "tracking API never fired (window missed)"
     if outcome == "parse_failed":
-        return "FAIL", "page rendered a result the parser could not read"
+        if real:
+            return "FAIL", "page rendered a result the parser could not read"
+        # A placeholder can't prove the parser either way: USPS answers its
+        # shared test numbers with "multiple items with that information"
+        # (measured 2026-10-22), which correctly yields no status.
+        return "WARN", ("page loaded, no readable status — expected for a "
+                        "placeholder (see the saved page text)")
     if real:
         return "FAIL", f"real number, no status ({outcome})"
     return "WARN", f"page loaded, no status — expected for a placeholder ({outcome})"
