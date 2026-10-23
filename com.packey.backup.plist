@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.packey.backup.plist — state snapshot (no sudo).
+
+  Why: every state file, the receipts and .env live on one Mac. The snapshot is
+  encrypted-at-rest data plus the key that opens it, so it is safe to keep
+  anywhere — but a backup you cannot restore is worse than none, which is why
+  backup_state.sh verifies every file by decrypting it before it prunes.
+
+  When: 03:30 daily AND every 6 hours (StartInterval). The calendar entry alone
+  was not enough: the Mac is usually asleep at 03:30, and launchd does not
+  reliably backfill a missed calendar job — which is how September 2026 went days
+  with no archive and nobody noticed. StartInterval is the sleep-proof half: when
+  the interval elapses during sleep, the job runs at the next wake. KEEP is sized
+  for that cadence (up to ~4-5 runs a day → 28 archives ≈ a week of history).
+
+  The passphrase is deliberately NOT in here: a plist is world-readable, so it
+  lives in the Keychain (service "packey-backup") and backup_state.sh reads it
+  from there. A run with no passphrase anywhere refuses and alerts the owner.
+
+  Install:  cp com.packey.backup.plist ~/Library/LaunchAgents/
+            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.packey.backup.plist
+  Remove:   launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.packey.backup.plist
+  Run now:  launchctl kickstart -k gui/$(id -u)/com.packey.backup
+  Snapshots land in ~/Backups/packey (override with BACKUP_DIR/KEEP in
+  EnvironmentVariables below) and the log line is appended to backup.log there.
+-->
+<plist version="1.0">
+<dict>
+  <key>UMask</key>
+  <integer>63</integer>
+  <key>Label</key>
+  <string>com.packey.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/fredp/glm-tracker/scripts/backup_state.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/fredp/glm-tracker</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd agents get a minimal PATH; python3 must be findable. -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>BACKUP_DIR</key>
+    <string>/Users/fredp/Backups/packey</string>
+    <key>KEEP</key>
+    <string>28</string>
+  </dict>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>30</integer>
+  </dict>
+  <!-- The sleep-proof half of the schedule — see the note at the top. -->
+  <key>StartInterval</key>
+  <integer>21600</integer>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/fredp/Library/Logs/packey/packey_backup.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/fredp/Library/Logs/packey/packey_backup.err</string>
+</dict>
+</plist>

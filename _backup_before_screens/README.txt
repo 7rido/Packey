@@ -1,0 +1,1 @@
+Backup of the files changed by the six-screens apply (2026-10-19). Restore: cp -p _backup_before_screens/{carriers.py,main.py,refresh.py,requirements.txt} . ; cp -p _backup_before_screens/tests/conftest.py tests/ ; rm screens.py tests/test_screens.py ; pip install aiogram==3.22.0

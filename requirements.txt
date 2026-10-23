@@ -1,0 +1,18 @@
+aiogram==3.31.0
+aiohttp>=3.9,<4
+httpx>=0.26,<1.0
+python-dotenv>=1.0
+
+# Required — NOT optional: the data files are encrypted at rest with this, and
+# without it storage.py silently falls back to writing PLAINTEXT, dropping the
+# promise the README and the bot's /privacy text both make.
+cryptography>=41.0
+
+# The Phantom deep-link rescue route (phantom_link.py) needs X25519 + XSalsa20-Poly1305,
+# which is exactly the pairing `cryptography` does NOT offer (it ships ChaCha20Poly1305
+# alone), so this cannot be folded into the dependency above. The route 404s when
+# PHANTOM_DEEPLINK=0, but the import sits at module level, so pynacl is a real
+# requirement: without it the Mini App would not start.
+pynacl>=1.5
+
+# Dev / tests: pip install -r requirements-dev.txt

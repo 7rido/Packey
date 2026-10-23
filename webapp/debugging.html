@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>When HTTP 200 lies — debugging a silent API change</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         color:#1a1a1a; background:#fff; max-width:44rem; margin:0 auto;
+         padding:2.4rem 1.2rem; font-size:17px; line-height:1.6; }
+  h1 { font-size:1.7rem; line-height:1.25; margin:0 0 .4rem; }
+  .byline { color:#666; font-size:.95rem; margin:0 0 1.4rem; }
+  h2 { font-size:1.15rem; margin:1.8rem 0 .5rem; }
+  ol, ul { padding-left:1.3rem; }
+  li { margin:.35rem 0; }
+  code { background:#f2f2f2; padding:.1rem .3rem; border-radius:3px; font-size:.95em; }
+  .end { color:#666; margin-top:2rem; font-size:.95rem; }
+</style>
+</head>
+<body>
+  <h1>Debugging a silent API change: when HTTP 200 lies</h1>
+  <p class="byline">Alfrido Phagoo</p>
+
+  <p>I run a package-tracking service that reads shipment status from several carrier
+  APIs (17TRACK, USPS, OnTrac, and a paid fallback). One day, tracking stopped updating
+  for a group of packages — but nothing in my logs said "error." Every request was
+  returning HTTP 200.</p>
+
+  <h2>The symptom</h2>
+  <p>Valid tracking numbers that had worked the day before came back with empty status
+  fields. No error code, no failed request, no rate-limit warning. Just <code>200 OK</code>
+  with nothing useful inside.</p>
+
+  <h2>How I investigated</h2>
+  <ol>
+    <li><b>Reproduced it outside the app.</b> I took a known-good tracking number and sent
+    the same request by hand with <code>curl</code>, so I could see the raw response
+    instead of my app's parsed version.</li>
+    <li><b>Compared it to a working case.</b> I put the broken response next to a good one
+    from a different package. Same endpoint, same authentication, same headers — the
+    difference was in the body.</li>
+    <li><b>Isolated the cause.</b> The provider had changed the shape of its response: a
+    field my code expected had moved, so my parser silently read nothing. The request was
+    fine; my assumption about the response was not.</li>
+  </ol>
+
+  <h2>The fix</h2>
+  <ul>
+    <li><b>Added validation.</b> If a response is <code>200</code> but the required fields
+    are missing, treat it as a failure instead of a success.</li>
+    <li><b>Added a fallback.</b> When the primary source returns nothing usable, try the
+    next source so tracking keeps working.</li>
+    <li><b>Wrote it down.</b> Documented the symptom and the fix so the same silent failure
+    would be recognized faster next time.</li>
+  </ul>
+
+  <h2>What I took from it</h2>
+  <p><code>200 OK</code> is not the same as "working." A healthy request can still return a
+  useless body, and a good integration checks the <b>content</b>, not just the status code.
+  That habit — reproduce with a raw request, compare to a known-good case, fix the cause,
+  write it up — is how I approach any integration problem, and it is the core of technical
+  support.</p>
+
+  <p class="end">— Alfrido Phagoo</p>
+</body>
+</html>

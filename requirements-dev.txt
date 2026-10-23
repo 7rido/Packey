@@ -1,0 +1,13 @@
+-r requirements.txt
+pytest>=7,<9
+# Static check used by tests/test_code_hygiene.py (catches edit residue like a
+# dropped `return` that behavioural tests cannot see).
+pyflakes>=3,<4
+
+# Test-only: writes the Code 128 image that tests/test_photo_ocr.py decodes with
+# zbar, so the barcode path is tested against a real symbol instead of a stub.
+# The runtime decoder itself is zbar's CLI (`brew install zbar`), not the pyzbar
+# binding: pyzbar cannot find Homebrew's libzbar here (ctypes.util.find_library
+# returns None), so it is not a dependency at all.
+python-barcode>=0.15
+Pillow>=10

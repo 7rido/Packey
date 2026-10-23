@@ -1,0 +1,44 @@
+# Secrets — never commit
+.env
+# ...nor any copy of it: backups like .env.bak-ua hold every real secret.
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Runtime data (contains tracking numbers / personal info)
+track_data.json
+pro_users.json
+refresh_limits.json
+register_cooldown.json
+mini_app_url.json
+pending_payments.json
+pro_receipts.json
+deposit_addrs.json
+share_links.json
+delivery_history.json
+admin_notify.json
+chat_settings.json
+sweep_state.json
+browser_throttle.json
+ship24_counter.json
+intl_registrations.json
+*.corrupt
+*.tmp
+*.bak
+
+
+# Logs
+*.log
+tracker.log.*
+
+# Debug capture dir (USPS_DEBUG_DIR) — masked page fixtures, still review before sharing
+dbg/
+
+# macOS
+.DS_Store
+.fedex_cookies.txt

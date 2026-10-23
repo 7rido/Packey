@@ -1,0 +1,21 @@
+--- a/main.py	2026-10-04 06:00:35.128263189 +0000
++++ b/main.py	2026-10-19 05:00:57.239013880 +0000
+@@ -1680,6 +1680,9 @@
+         # paid lookup). Caps and the per-chat lock are enforced inside _add_packages,
+         # so this path cannot bypass them. A rename answer wins above on purpose: the
+         # prompt asked for a name, so a number-looking reply IS the name.
++        import screens  # screen 4's "Custom name" answer (inert unless one is pending)
++        if await screens.apply_custom_name(message):
++            return
+         ids = parse_track_args(message.text, has_command=False)[0]
+         if ids:
+             await _ask_barcode_add(message, ids, source="message")
+@@ -2201,6 +2204,8 @@
+ 
+     dp = Dispatcher()
+     dp.include_router(router)
++    import screens  # six review-able screens (screens.py); own router, own callbacks
++    dp.include_router(screens.router)
+ 
+     bot = Bot(token=token)
+     # botstate owns the live handle read by pro/ui/refresh; refresh.save_now

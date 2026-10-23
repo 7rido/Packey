@@ -1,0 +1,29 @@
+Vendored third-party assets for the Mini App dashboard.
+
+qrcode.min.js
+  library  : davidshimjs/qrcodejs (qrcodejs — table/canvas QR renderer)
+  upstream : https://cdn.jsdelivr.net/gh/davidshimjs/qrcodejs@04f46c6a0708418cb7b96fc563eacae0fbf77674/qrcode.min.js
+             (commit-pinned form; the dashboard used to load this library from
+             the repository's mutable default branch, with no integrity pin)
+  resolved : commit 04f46c6a0708418cb7b96fc563eacae0fbf77674 (2015-11-25)
+  fetched  : 2026-09-21
+  sha256   : c541ef06327885a8415bca8df6071e14189b4855336def4f36db54bde8484f36
+  bytes    : 19927
+
+Why vendored: a mutable CDN branch is a supply-chain risk. A changed upstream
+file would run with full dashboard privileges — next to the Telegram initData
+credentials — and this library draws the Solana payment QR. The file is kept
+byte-identical to upstream so its sha256 stays verifiable; the hash lives here
+rather than in a header comment inside the file, which would change the bytes
+and make the recorded hash unverifiable against the file it describes.
+
+Served from our own origin by miniapp.py (GET /vendor/{name}); index.html
+loads it as vendor/qrcode.min.js. Nothing here may be fetched from a CDN at
+runtime.
+
+Updating it (deliberate, never automatic):
+  1. curl -sSL -o webapp/vendor/qrcode.min.js <commit-pinned upstream url>
+  2. shasum -a 256 webapp/vendor/qrcode.min.js
+  3. update the resolved commit / fetched date / sha256 / bytes above
+  4. python3 -m pytest tests/test_miniapp_contract.py tests/test_miniapp_qr.py
+     (the contract test fails when the recorded sha256 and the file disagree)

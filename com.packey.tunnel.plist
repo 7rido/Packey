@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  com.packey.tunnel.plist — supervise the Mini App tunnel + bot (no sudo).
+  Install:  cp com.packey.tunnel.plist ~/Library/LaunchAgents/
+            launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.packey.tunnel.plist
+  Remove:   launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.packey.tunnel.plist
+  NOTE: edit ProgramArguments to match your setup:
+    --watch             → quick-tunnel supervision (re-mints a random URL)
+    --watch --funnel    → Tailscale Funnel (STABLE URL): no minting, no .env
+                          rewrites — just health-checks the public URL and keeps
+                          the bot alive. This is what this machine runs.
+-->
+<plist version="1.0">
+<dict>
+  <key>UMask</key>
+  <integer>63</integer>
+  <key>Label</key>
+  <string>com.packey.tunnel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/fredp/glm-tracker/tunnel.sh</string>
+    <string>--watch</string>
+    <string>--funnel</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/fredp/glm-tracker</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- launchd agents inherit a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin),
+         and tunnel.sh's guard uses `command -v cloudflared`, which lives in
+         Homebrew's prefix. Without this the script exits 1 with
+         "cloudflared is not installed". -->
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/fredp/Library/Logs/packey/packey_tunnel_watch.out</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/fredp/Library/Logs/packey/packey_tunnel_watch.err</string>
+</dict>
+</plist>

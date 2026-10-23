@@ -1,0 +1,2321 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1621" id="themeColor">
+<meta name="color-scheme" content="light dark">
+<title>Packey — Package Tracker</title>
+<!-- No webfont, on purpose: the Google Fonts stylesheet was the only third-party
+     request the dashboard made, so every open handed a font CDN the user's IP.
+     The fallback stacks in <style> cover all three families ('Inter' →
+     -apple-system/system-ui, 'Sora' → sans-serif, 'JetBrains Mono' → monospace). -->
+<script>
+// ── Head-safe early watchdog (runs BEFORE the <script src> tags below) ──
+// A SYNCHRONOUS external script that hangs — a CDN unreachable on the device's
+// network — freezes HTML parsing, so the app's own watchdog further down never
+// executes and the webview stays pure white with nothing to show. That is the
+// one failure mode where "blank" carries no clue, so this block runs first and
+// arms a timer that can still paint a message. The richer watchdog below (which
+// can use the app's DOM) takes over by setting window.__packeyBootFail; when it
+// exists, this one stays silent and lets that one report.
+(function () {
+  var painted = false;
+  var box = null;
+  function paint(msg) {
+    if (painted) return box;
+    painted = true;
+    try {
+      var el = document.createElement('div');
+      el.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:flex;' +
+        'flex-direction:column;align-items:center;justify-content:center;gap:10px;' +
+        'padding:28px;text-align:center;background:#0f1216;color:#e8eef4;' +
+        'font:600 13px/1.6 -apple-system,system-ui,sans-serif';
+      el.innerHTML = '<div style="font-size:34px">📡</div>' +
+        "<div>Couldn't start the app</div>" +
+        '<div style="font-weight:500;opacity:.75">' + msg + '</div>' +
+        '<button id="earlyRetry" style="margin-top:6px;padding:9px 16px;border:0;' +
+        'border-radius:10px;font:600 13px inherit;background:#4f8cff;color:#fff">' +
+        'Retry</button>';
+      el.querySelector('#earlyRetry').onclick = function () { window.location.reload(); };
+      (document.body || document.documentElement).appendChild(el);
+      box = el;
+    } catch (e) {}
+    return box;
+  }
+  window.__packeyEarlyFail = paint;
+  // Kill the theme flash: the stylesheet bakes DARK in for first paint, and
+  // applyTheme() only runs at the end of the main script — a light/pink user saw
+  // a dark flash on every open. The saved choice is on <html> here (body does not
+  // exist yet; the CSS selectors match [data-theme] on either element). A user who
+  // never picked a theme still gets one flash — Telegram's own script loads AFTER
+  // this block, so colorScheme is not readable yet; choosing a theme once fixes it.
+  try {
+    var saved = localStorage.getItem('pkgTheme');
+    if (saved === 'light' || saved === 'pink' || saved === 'dark') {
+      document.documentElement.dataset.theme = saved;
+    }
+  } catch (e) {}
+  // Take the message away again if the app finishes booting after we painted:
+  // a SLOW-but-working load (congested network) is far more common than a dead
+  // one, and a stale error screen sitting over a working app is worse than the
+  // delay it was reporting.
+  setInterval(function () {
+    if (!window.__packeyReady) return;
+    try { if (box) box.remove(); } catch (e) {}
+    box = null;
+    // The independent watchdog's box too: a SLOW boot can have tripped it
+    // before the app finished, and a stale error screen over a working app
+    // is worse than the delay it reported.
+    try { if (window.__packeyErrorBox) { window.__packeyErrorBox.remove(); } } catch (e) {}
+    window.__packeyErrorBox = null;
+  }, 1000);
+  setTimeout(function () {
+    if (window.__packeyReady) return;                        // app booted
+    if (typeof window.__packeyBootFail === 'function') return;  // richer watchdog reports
+    paint('A request needed to start the app stalled — check the connection and retry.');
+  }, 8000);
+})();
+</script>
+<link rel="preconnect" href="https://telegram.org">
+<link rel="dns-prefetch" href="https://telegram.org">
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<!-- Vendored locally (webapp/vendor/qrcode.min.js — provenance and sha256 in
+     webapp/vendor/README): a mutable CDN branch next to the payment QR was a
+     supply-chain risk. Still optional at runtime (every use site guards
+     window.QRCode) — so it must NOT be synchronous: a hanging request here
+     would blank the whole app. -->
+<script defer src="vendor/qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: var(--font);
+    font-size: var(--fs-md); line-height: 1.45;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh; letter-spacing: -0.01em;
+    transition: background-color .25s ease, color .25s ease;
+    /* ── Design tokens ───────────────────────────────────────────────────────────
+       One accent, one type scale, one radius scale; every rule below reads these
+       rather than a raw value. Two things this fixed: the primary payment button
+       carried a hardcoded amber gradient no theme could reach, and three font
+       families ('Sora', 'Inter', 'JetBrains Mono') were referenced throughout but
+       never loaded — the webfont request was deliberately removed for privacy, so
+       the CSS described a typography that never rendered.                      */
+    --font: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+    --fs-2xs: 11px;      /* uppercase labels, footnotes */
+    --fs-xs: 12.5px;     /* captions, meta, notes */
+    --fs-sm: 14px;       /* secondary body, buttons, controls */
+    --fs-md: 15px;       /* body */
+    --fs-lg: 17px;       /* card, sheet and empty-state titles */
+    --fs-display: 25px;  /* the app title */
+    --fs-amount: 46px;   /* the amount a payer must send */
+    --r-sm: 10px;        /* fields, addresses, notes */
+    --r-md: 14px;        /* buttons, toasts */
+    --r-lg: 16px;        /* cards, sheets, QR tile */
+    --r-pill: 999px;
+    /* This block IS the dark theme (first paint, before data-theme applies) */
+    --bg: #06090f;
+    --bg-soft: rgba(79,140,255,.05);
+    --card: #0b1119;
+    --sheet: #0a0f16;
+    --text: #f2f5f7;
+    --muted: #8b98a5;
+    --line: rgba(255,255,255,.08);
+    --hair: rgba(255,255,255,.06);
+    --field: rgba(255,255,255,.06);
+    --chip: transparent;
+    --shadow: 0 10px 28px rgba(0,0,0,.55);
+    --toast: rgba(10,15,22,.96);
+    --toast-text: #fff;
+    --skel: rgba(255,255,255,.06);
+    --qr-tile: #ffffff;
+    /* The one accent. A single hue instead of a gradient pair, so links, active
+       controls and the payment button read as one family — and so every theme can
+       reach the payment button (it carried an amber gradient no theme could
+       restyle). */
+    --brand1: #4f8cff;
+    --btn: #2f6bff;          /* filled controls: white text clears AA on it */
+    --btn-text: #fff;
+    --btn-glow: rgba(79,140,255,.32);
+    --warn: #ffb37a;
+  }
+  [data-theme="light"] {
+    --bg: #f4f6fa;
+    --bg-soft: #eef1f6;
+    --card: #ffffff;
+    --sheet: #ffffff;
+    --text: #101828;
+    --muted: #667085;
+    --line: rgba(16,24,40,.12);
+    --hair: rgba(16,24,40,.08);
+    --field: rgba(16,24,40,.045);
+    --chip: transparent;
+    --shadow: 0 10px 26px rgba(16,24,40,.10);
+    --toast: rgba(16,24,40,.94);
+    --toast-text: #fff;
+    --skel: rgba(16,24,40,.07);
+    --qr-tile: #ffffff;
+    --brand1: #2563eb;
+    --btn: #2563eb;
+    --btn-text: #fff;
+    --btn-glow: rgba(37,99,235,.28);
+    --warn: #b54708;
+  }
+  [data-theme="dark"] {
+    /* Dark: the default, and the palette the other themes are built from */
+    --bg: #06090f;
+    --bg-soft: rgba(79,140,255,.05);
+    --card: #0b1119;
+    --sheet: #0a0f16;
+    --text: #f2f5f7;
+    --muted: #8b98a5;
+    --line: rgba(255,255,255,.08);
+    --hair: rgba(255,255,255,.06);
+    --field: rgba(255,255,255,.06);
+    --chip: transparent;
+    --shadow: 0 10px 28px rgba(0,0,0,.55);
+    --toast: rgba(10,15,22,.96);
+    --toast-text: #fff;
+    --skel: rgba(255,255,255,.06);
+    --qr-tile: #ffffff;
+    --brand1: #4f8cff;
+    --btn: #2f6bff;
+    --btn-text: #fff;
+    --btn-glow: rgba(79,140,255,.32);
+    --warn: #ffb37a;
+  }
+  [data-theme="pink"] {
+    --bg: #1d1020;
+    --bg-soft: rgba(255,77,141,.08);
+    --card: #2a1526;
+    --sheet: #241220;
+    --text: #fff0f5;
+    --muted: #d99ab3;
+    --line: rgba(255,143,184,.20);
+    --hair: rgba(255,143,184,.14);
+    --field: rgba(255,77,141,.10);
+    --chip: transparent;
+    --shadow: 0 10px 28px rgba(80,10,45,.40);
+    --toast: rgba(43,18,36,.96);
+    --toast-text: #ffe4ee;
+    --skel: rgba(255,143,184,.12);
+    --qr-tile: #ffffff;
+    --brand1: #ff4d8d;
+    --btn: #d6246b;          /* deeper than the tint, so white text clears AA */
+    --btn-text: #fff;
+    --btn-glow: rgba(255,77,141,.30);
+    --warn: #ffc2a8;
+  }
+  .app { max-width: 540px; margin: 0 auto; padding: 0 14px 46px; }
+
+  .hero { position: sticky; top: 0; z-index: 10;
+    background: var(--bg);
+    /* safe-area: viewport-fit=cover lets the page run under the notch/Dynamic
+       Island, so the sticky hero needs the top inset or the title hides under it. */
+    padding: calc(8px + env(safe-area-inset-top)) 2px 12px;
+    border-bottom: 1px solid var(--hair);
+    transition: background-color .25s ease; }
+  .hero-top { display: flex; align-items: flex-start; justify-content: space-between; }
+  h1 { font-family: var(--font); font-size: var(--fs-display); font-weight: 700;
+       letter-spacing: -.025em; margin: 0; }
+  h1 em { font-style: normal; color: var(--brand1); }
+  .sub { margin: 3px 0 0; color: var(--muted);
+         font-size: var(--fs-sm); font-weight: 500; letter-spacing: .01em; }
+  .icon-btn { width: 42px; height: 42px; border-radius: 50%; cursor: pointer;
+    border: 1px solid var(--line); flex: none;
+    background: var(--btn);
+    color: var(--btn-text); font-size: var(--fs-lg);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 14px var(--btn-glow); transition: transform .15s; }
+  .icon-btn:active { transform: scale(.92); }
+  .icon-btn:disabled { opacity: .55; }
+  .icon-btn.spinning { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .chips { display: flex; gap: 8px; margin-top: 14px; overflow-x: auto;
+           scrollbar-width: none; -webkit-overflow-scrolling: touch;
+           padding-right: 24px;
+           -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent);
+           mask-image: linear-gradient(to right, #000 calc(100% - 28px), transparent); }
+  .chips::-webkit-scrollbar { display: none; }
+  .chip { padding: 7px 15px; border-radius: var(--r-pill); cursor: pointer; white-space: nowrap;
+    border: 1px solid var(--line); background: var(--chip); font-family: inherit;
+    color: var(--muted);
+    font-size: var(--fs-sm); font-weight: 600; transition: opacity .15s; }
+  .chip.active { background: var(--btn);
+    border-color: transparent; color: var(--btn-text); }
+  /* Locked chip (🌍 International for free users): still readable, clearly
+     not available — tapping it opens the Pro sheet. */
+  .chip.locked { opacity: .75; border-style: dashed; }
+
+  /* ── Quota meter — the 🌍 International view (Pro) ─── */
+  .card.quota { padding: 14px 16px; }
+  .quota-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+  .quota-title { font-family: var(--font); font-size: var(--fs-sm); font-weight: 700; }
+  .quota-pct { font-size: var(--fs-sm); font-weight: 700; color: var(--ac, #8b98a5); }
+  .bar { height: 7px; border-radius: var(--r-pill); background: var(--line); overflow: hidden;
+         margin: 10px 0 8px; }
+  .bar > i { display: block; height: 100%; border-radius: var(--r-pill);
+             background: var(--ac, #34d186); transition: width .4s ease; }
+  .quota-note { margin: 0; font-size: var(--fs-xs); line-height: 1.45; opacity: .8; }
+
+  /* ── Theme control — segmented Light / Dark / Pink ─── */
+  .theme-row { margin-top: 8px; display: flex; justify-content: flex-start; }
+  .theme-seg { display: inline-flex; gap: 2px; padding: 2px; flex: none;
+    border: 1px solid var(--line); border-radius: var(--r-pill); background: var(--field); }
+  .theme-seg button { border: none; background: transparent; cursor: pointer;
+    font-family: var(--font);
+    font-size: var(--fs-xs); font-weight: 700; color: var(--muted);
+    padding: 6px 9px; border-radius: var(--r-pill); min-height: 32px; min-width: 40px; }
+  .theme-seg button.active { background: var(--btn);
+    color: var(--btn-text); box-shadow: 0 2px 8px var(--btn-glow); }
+  .theme-seg button:active { transform: scale(.95); }
+  .theme-seg button:focus-visible { outline: 2px solid var(--brand1); outline-offset: 1px; }
+
+  /* ── Pro tier ────────────────────────────────── */
+  .pro-badge { display: inline-block; vertical-align: 4px; margin-left: 7px;
+    font-weight: 700; font-size: var(--fs-2xs); font-family: var(--font);
+    letter-spacing: .1em; color: var(--btn-text);
+    background: var(--btn);
+    padding: 3px 9px; border-radius: var(--r-pill); }
+  .tier-row { display: flex; align-items: center; justify-content: space-between;
+    margin-top: 11px; gap: 8px; }
+  .tier-text { font-size: var(--fs-xs); font-weight: 600;
+    color: var(--muted); }
+  .upgrade-btn { border: none; border-radius: var(--r-pill); padding: 7px 14px;
+    font-weight: 700; font-size: var(--fs-xs); font-family: var(--font);
+    color: var(--btn-text); cursor: pointer; flex: none;
+    background: var(--btn);
+    box-shadow: 0 2px 10px var(--btn-glow); }
+  .upgrade-btn:active { transform: scale(.95); }
+  .pro-price-big { text-align: center; font-family: var(--font);
+    font-size: var(--fs-amount); font-weight: 700; letter-spacing: -.03em; margin: 10px 0 2px; }
+  .pro-duration { text-align: center; font-size: var(--fs-xs); font-weight: 600;
+    color: var(--muted); margin-bottom: 14px; }
+  .pro-features-ios { border-top: 1px solid var(--hair); margin: 14px 0 4px; }
+  .pro-features-ios .feature { display: flex; align-items: center; gap: 10px;
+    padding: 11px 2px; border-bottom: 1px solid var(--hair); font-size: var(--fs-sm); }
+  .pro-features-ios .feature:last-child { border-bottom: none; }
+  .pro-features-ios .f-label { font-weight: 600; flex: 1; }
+  .pro-features-ios .feature em { font-style: normal; font-size: var(--fs-2xs);
+    color: var(--muted); }
+  .pay-instructions { text-align: center; font-size: var(--fs-2xs); font-weight: 700;
+    letter-spacing: .1em; text-transform: uppercase; margin: 16px 0 6px;
+    color: var(--muted); }
+  .pay-wallet-ios { display: block; font-family: var(--mono);
+    font-size: var(--fs-sm); font-weight: 600; line-height: 1.6; word-break: break-all; text-align: center;
+    background: var(--field); border-radius: var(--r-sm); padding: 12px 14px;
+    color: var(--text); cursor: pointer;
+    min-height: 48px; user-select: text; -webkit-user-select: text; }
+  .pay-wallet-ios:active { background: rgba(255,255,255,.09); }
+  .same-wallet-note { text-align: center; font-family: var(--font);
+    font-size: var(--fs-xs); font-weight: 600; margin: 8px 0 0;
+    color: var(--muted); }
+  .same-wallet-note b { color: var(--text); }
+  .warn-chain { text-align: center; font-family: var(--font);
+    font-size: var(--fs-2xs); font-weight: 600; margin: 6px 0 0; color: var(--warn); }
+  .btn-copy-ios { display: block; width: 100%; margin: 8px 0 4px; padding: 12px 0;
+    border-radius: var(--r-md); border: none; cursor: pointer;
+    font-family: var(--font);
+    font-size: var(--fs-sm); font-weight: 700; min-height: 48px;
+    background: rgba(255,255,255,.08); color: var(--text); }
+  /* The one payment action. Same geometry as the copy button, filled like the upgrade
+     pill, because it is the only thing the sheet asks the payer to press. */
+  .btn-open-ios { display: block; width: 100%; margin: 14px 0 2px; padding: 13px 0;
+    border-radius: var(--r-md); border: none; cursor: pointer;
+    font-family: var(--font);
+    font-size: var(--fs-md); font-weight: 700; min-height: 50px; color: var(--btn-text);
+    background: var(--btn); }
+  .btn-open-ios:active { transform: scale(.97); }
+  .btn-copy-ios:active { transform: scale(.97); }
+  .qr-ios { display: flex; justify-content: center; margin: 14px auto;
+    padding: 14px; background: var(--qr-tile); border-radius: var(--r-lg); width: fit-content;
+    border: 3px solid transparent;
+    background-clip: padding-box;
+    box-shadow: 0 4px 20px rgba(0,0,0,.25); }
+  .qr-ios img, .qr-ios canvas { display: block; border-radius: var(--r-sm);
+    image-rendering: pixelated; }
+  .qr-caption { text-align: center; font-family: var(--font);
+    font-size: var(--fs-xs); font-weight: 600; color: var(--muted);
+    margin: -6px 0 12px; }
+  .pay-status-ios { text-align: center; font-size: var(--fs-xs); margin-top: 12px;
+    color: var(--muted); font-weight: 600; }
+  .pay-status-ios.ok { color: #34d186; }
+  .token-picker { display: flex; gap: 8px; justify-content: center; margin: 4px 0 6px; }
+  .token-opt { border: 1px solid var(--line); background: var(--field);
+    color: var(--text); font-family: var(--font);
+    font-size: var(--fs-sm); font-weight: 700;
+    padding: 10px 24px; border-radius: var(--r-pill); cursor: pointer; min-height: 44px; }
+  .token-opt.active { border-color: transparent; color: var(--btn-text);
+    background: var(--btn);
+    box-shadow: 0 2px 10px var(--btn-glow); }
+  .token-opt:active { transform: scale(.96); }
+  /* Incoming / outgoing segmented control (Pro only — hidden for free chats). */
+  .dir-seg { display: flex; gap: 8px; margin: 2px 0 6px; }
+  .dir-seg button { flex: 1; border: 1px solid var(--line); background: var(--field);
+    color: var(--text); font-family: var(--font);
+    font-size: var(--fs-sm); font-weight: 700;
+    padding: 10px 0; border-radius: var(--r-pill); cursor: pointer; min-height: 44px; }
+  .dir-seg button.active { border-color: transparent; color: var(--btn-text);
+    background: var(--btn); }
+  .dir-seg button:active { transform: scale(.96); }
+  .badge-dir { margin-left: 6px; opacity: .92; }
+  .pro-back { display: inline-flex; align-items: center; gap: 6px;
+    border: none; background: none; cursor: pointer; padding: 8px 4px; margin-bottom: 6px;
+    color: var(--muted);
+    font-family: var(--font);
+    font-size: var(--fs-sm); font-weight: 700; min-height: 44px; }
+  .pro-back:active { transform: scale(.95); opacity: .7; }
+  /* Pro sheet scrolls internally so QR + wallet buttons stay reachable */
+  #proSheet .sheet-card { max-height: 88vh; overflow-y: auto;
+    -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+
+  .section-h { margin: 20px 2px 8px; font-size: var(--fs-2xs); font-weight: 700;
+    letter-spacing: .14em; text-transform: uppercase;
+    color: var(--muted); }
+.card { position: relative; overflow: hidden;
+    background: var(--sheet);
+    border: 1px solid var(--line); border-bottom: none;
+    border-radius: var(--r-lg); padding: 16px 16px 14px 20px;
+    margin: 10px 0; box-shadow: 0 1px 3px rgba(0,0,0,.28); }
+  .card.done { opacity: .82; }
+  /* Attention cards (Exception / Delivery Attempted) read as problems:
+     stronger status-colored accent + tinted left edge wash. */
+  .card.attention { border-color: color-mix(in srgb, var(--ac, #8b98a5) 45%, var(--line));
+    box-shadow: 0 1px 3px rgba(0,0,0,.28), inset 3px 0 0 var(--ac, #8b98a5); }
+  .card.attention .accent { width: 5px; }
+  .section-h.attention-h { color: var(--ac, #ff5c5c); }
+  .section-h .clear-delivered { margin-left: 10px; }
+  .accent { position: absolute; left: 0; top: 0; bottom: 0; width: 3px;
+            background: var(--ac, #8b98a5); }
+  /* wrap: a long status label (outgoing deliveries) plus the direction badge
+     must push the badges to their own line instead of crushing the title. */
+  .card-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+  .title { font-family: var(--font); font-size: var(--fs-lg); font-weight: 700;
+           letter-spacing: -.01em; margin: 0; word-break: break-word; }
+  .badge { font-size: var(--fs-sm); font-weight: 700; letter-spacing: .04em; white-space: nowrap;
+    padding: 5px 12px; border-radius: var(--r-pill);
+    color: var(--ac, #8b98a5); background: var(--ac-soft, rgba(139,152,165,.14)); }
+  .tid-row { display: flex; align-items: center; gap: 7px; margin-top: 7px; }
+  .tid { font-family: var(--mono); font-size: var(--fs-sm); font-weight: 500;
+    letter-spacing: .04em; word-break: break-all;
+    color: var(--muted);
+    background: var(--field); padding: 5px 10px; border-radius: var(--r-sm); }
+  a.tid { text-decoration: none; cursor: pointer; transition: opacity .15s; }
+  a.tid:active { opacity: .6; }
+  .copy { border: none; background: none; cursor: pointer;
+    color: var(--muted); font-size: var(--fs-lg); line-height: 1;
+    padding: 0; min-width: 44px; min-height: 44px; margin-right: -8px;
+    display: inline-flex; align-items: center; justify-content: center;
+    flex: none; }
+  .copy:active { transform: scale(.85); }
+
+  .route { display: flex; align-items: center; margin: 13px 0 0; padding: 0 1px; }
+  .node { width: 9px; height: 9px; flex: none; border-radius: 50%;
+          border: 2px solid var(--line); background: transparent; }
+  .node.hit { background: var(--ac, #8b98a5); border-color: var(--ac, #8b98a5); }
+  .node.cur { box-shadow: 0 0 0 4px var(--ac-soft, rgba(139,152,165,.2)); }
+  .rail { flex: 1; height: 2px; margin: 0 4px;
+          background: var(--line); border-radius: 2px; }
+  .rail.hit { background: var(--ac, #8b98a5); }
+  .route-labels { display: flex; justify-content: space-between; margin-top: 5px;
+    font-size: var(--fs-2xs); font-weight: 700; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--muted); }
+
+  .detail { margin: 11px 0 0; font-size: var(--fs-sm); opacity: .88; }
+  .character { margin: 9px 0 0; font-size: var(--fs-xs); font-style: italic; opacity: .7; }
+  .blocked-note { margin: 11px 0 0; font-size: var(--fs-xs); line-height: 1.5;
+    color: var(--muted); background: var(--field); border-radius: var(--r-sm);
+    padding: 9px 12px; }
+  .blocked-note b { color: var(--text); }
+  .meta { margin-top: 9px; font-size: var(--fs-xs); color: var(--muted); }
+  .meta b { font-weight: 600; color: var(--text); }
+
+  .actions { display: flex; gap: 10px; margin-top: 14px; }
+  .actions.secondary { margin-top: 10px; }
+  /* Action rows collapse into the card: taps on the card body toggle
+     .open (see wireCard), so the buttons stop hogging vertical space. */
+  .card .actions { display: none; }
+  .card.open .actions { display: flex; }
+  .card .chev { transition: transform .15s; color: var(--muted);
+    font-size: var(--fs-lg); line-height: 1; align-self: center;
+    margin-left: auto; }
+  .card.open .chev { transform: rotate(90deg); }
+  .btn { flex: 1; padding: 12px 0; border-radius: var(--r-md); cursor: pointer;
+    font-size: var(--fs-sm); font-weight: 600; font-family: inherit;
+    border: 1px solid var(--line); background: transparent;
+    color: var(--text);
+    transition: transform .12s, opacity .15s; }
+  .btn:active { transform: scale(.96); }
+  .btn:disabled { opacity: .5; }
+  .btn.primary { background: var(--btn);
+    color: var(--btn-text); border-color: transparent; }
+  .btn.danger { color: #ff6b6b; border-color: rgba(255,107,107,.35); }
+
+  .state { text-align: center; padding: 56px 16px; }
+  .state .big { font-size: var(--fs-amount); }
+  .state h3 { font-family: var(--font); font-size: var(--fs-lg); margin: 12px 0 6px; }
+  .state p { color: var(--muted); font-size: var(--fs-sm);
+             margin: 0 auto; max-width: 300px; }
+  .state .btn { margin-top: 18px; flex: none; padding: 9px 22px;
+                display: inline-block; text-decoration: none; }
+  .error-text { color: #ff6b6b; }
+
+  /* The outside-Telegram landing: the one page a stranger may ever see (a shared
+     link, the bare domain), so it carries the product intro — hero, a demo card
+     built from the app's own card CSS, the pitch, and the way in. Same tokens as
+     everything else; the numbers in the copy are baked-in fallbacks pinned to
+     config by tests/test_copy_truth.py (the landing cannot read .env). */
+  .landing { padding: 26px 20px calc(26px + env(safe-area-inset-bottom)); }
+  .landing p { max-width: none; }
+  .landing-hero { text-align: center; }
+  .landing-hero .big { font-size: 54px; }
+  .landing .lede { color: var(--text); font-size: var(--fs-md);
+                   line-height: 1.55; margin-top: 10px; }
+  /* The CTA margin rides the existing btn primary selector — no extra class, so
+     the pinned way-in test (class="btn primary") keeps matching the markup. */
+  .landing .btn.primary { margin-top: 16px; }
+  .qr-hint { color: var(--muted); font-size: var(--fs-2xs); margin: 14px 0 8px; }
+  .landing-qr { display: flex; justify-content: center; min-height: 10px; }
+  .landing-qr canvas { background: #fff; padding: 6px; border-radius: var(--r-sm); }
+  .landing .card { margin: 12px 0 0; }
+  .landing-note { text-align: center; color: var(--muted);
+                  font-size: var(--fs-2xs); margin: 10px 0 0; }
+  .landing ul, .landing ol { color: var(--muted); font-size: var(--fs-sm);
+                             line-height: 1.55; }
+  .landing ul { list-style: none; margin: 10px 0 0; padding: 0; }
+  .landing ul li { margin: 12px 0; }
+  .landing ul b { color: var(--text); }
+  .landing ol { margin: 10px 0 0; padding-left: 20px; }
+  .landing ol li { margin: 8px 0; }
+  .landing hr { border: none; border-top: 1px solid var(--hair); margin: 20px 0; }
+
+  .skel { height: 138px; border-radius: var(--r-lg); margin: 10px 0;
+    background: linear-gradient(100deg, var(--skel) 40%, var(--hair) 50%, var(--skel) 60%);
+    background-size: 200% 100%; animation: sh 1.3s infinite; }
+  @keyframes sh { to { background-position: -200% 0; } }
+
+  /* Reduced motion: kill spin, shimmer and press-transforms. Layout, color
+     and content stay identical — only movement goes away. */
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation: none !important; transition: none !important; }
+    .sheet-card, .skel, .icon-btn.spinning { animation: none !important; transition: none !important; }
+    .icon-btn:active, .btn:active, .mini-btn:active, .copy:active,
+    .token-opt:active, .upgrade-btn:active,
+    .btn-copy-ios:active, .btn-open-ios:active, .pro-back:active { transform: none !important; }
+  }
+
+  .foot { text-align: center; margin-top: 22px; font-size: var(--fs-2xs);
+          color: var(--muted); letter-spacing: .02em;
+          /* safe-area: keep the footer above the home indicator */
+          padding-bottom: calc(10px + env(safe-area-inset-bottom)); }
+  .foot-link { color: var(--brand1); cursor: pointer; text-decoration: underline;
+               text-underline-offset: 2px; }
+  #syncLine { cursor: pointer; }
+  .priv-body { font-size: var(--fs-sm); line-height: 1.55; color: var(--text);
+               text-align: left; max-height: 46vh; overflow-y: auto; margin: 10px 0 4px; }
+  .priv-body p { margin: 0 0 10px; }
+  .priv-body b { color: var(--brand1); }
+
+  /* ── Share sheet ─────────────────────────────── */
+  .share-url { font-family: var(--mono); font-size: var(--fs-xs);
+    word-break: break-all; background: var(--field);
+    border-radius: var(--r-sm); padding: 12px; color: var(--text);
+    user-select: text; -webkit-user-select: text; cursor: text; }
+  .share-life { color: var(--muted); font-size: var(--fs-xs); line-height: 1.5;
+    text-align: center; margin: 10px 0 2px; }
+  /* Two rows of two: copy is the primary, revoke the destructive one. */
+  .share-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+  .share-grid .btn { flex: 1 1 44%; min-height: 46px; }
+
+  .toast { position: fixed; left: 50%; bottom: calc(26px + env(safe-area-inset-bottom));
+    z-index: 60;
+    transform: translateX(-50%) translateY(16px); opacity: 0;
+    transition: all .25s ease; pointer-events: none;
+    background: var(--toast);
+    color: var(--toast-text);
+    padding: 10px 18px; border-radius: var(--r-md);
+    font-size: var(--fs-sm); font-weight: 600; text-align: center; max-width: 86vw;
+    box-shadow: 0 8px 24px rgba(0,0,0,.4); }
+  /* ── Add sheet + rename ──────────────────────── */
+  .hero-btns { display: flex; gap: 8px; }
+  /* min-width: a badge is nowrap, so without a floor the flex line squeezes the
+     title to one character per line (seen with the long outgoing label) instead
+     of wrapping the badge onto the next line. */
+  .title-wrap { display: flex; align-items: center; gap: 6px; min-width: 11ch; flex: 1 1 auto; }
+  .mini-btn { border: none; background: none; cursor: pointer; padding: 0;
+    color: var(--muted); font-size: var(--fs-lg); line-height: 1;
+    min-width: 36px; min-height: 36px; flex: none;
+    display: inline-flex; align-items: center; justify-content: center; }
+  .mini-btn:active { transform: scale(.85); }
+  .title-input { flex: 1; min-width: 0; font-family: var(--font); font-size: var(--fs-md);
+    font-weight: 700; padding: 6px 10px; border-radius: var(--r-sm);
+    border: 1px solid var(--btn);
+    background: var(--field); color: inherit; outline: none; }
+  .sheet { position: fixed; inset: 0; z-index: 40; display: flex;
+    align-items: flex-end; justify-content: center; background: rgba(0,0,0,.55);
+    opacity: 0; pointer-events: none; transition: opacity .2s ease; }
+  .sheet.open { opacity: 1; pointer-events: auto; }
+  .sheet-card { width: 100%; max-width: 540px;
+    background: var(--card);
+    border-radius: var(--r-lg) var(--r-lg) 0 0; padding: 20px 16px 26px;
+    /* safe-area: sheets dock to the screen bottom, over the home indicator */
+    padding-bottom: calc(26px + env(safe-area-inset-bottom));
+    transform: translateY(100%); transition: transform .3s cubic-bezier(.32,.72,0,1);
+    box-shadow: 0 -8px 40px rgba(0,0,0,.45); }
+  .sheet.open .sheet-card { transform: translateY(0); }
+  .sheet-card h3 { font-family: var(--font); font-size: var(--fs-lg); margin: 0 0 14px; }
+  .field { display: block; width: 100%; padding: 13px 14px; margin-bottom: 10px;
+    border-radius: var(--r-md); border: 1px solid var(--line);
+    background: var(--field); color: inherit; font-size: var(--fs-md);
+    font-family: inherit; outline: none; }
+  .field:focus { border-color: var(--btn); }
+  .sheet-actions { display: flex; gap: 8px; margin-top: 4px; }
+  .sheet-actions .btn { flex: 1; padding: 12px 0; font-size: var(--fs-sm); }
+  .sheet-hint { margin: 13px 0 0; text-align: center; font-size: var(--fs-2xs);
+    letter-spacing: .04em; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="hero">
+    <div class="hero-top">
+      <div>
+        <h1>Pack<em>ey</em><span class="pro-badge" id="proBadge" style="display:none">PRO</span></h1>
+        <p class="sub" id="summary" aria-live="polite">Loading your shipments…</p>
+      </div>
+      <div class="hero-btns">
+        <button class="icon-btn" id="addBtn" aria-label="Add package" title="Add package">+</button>
+      </div>
+    </div>
+    <div class="theme-row" id="themeSegRow" style="display:none">
+      <div class="theme-seg" id="themeSeg" role="radiogroup" aria-label="Color theme">
+        <button type="button" data-theme-opt="light" role="radio" title="Light theme">Light</button>
+        <button type="button" data-theme-opt="dark" role="radio" title="Dark theme">Dark</button>
+        <button type="button" data-theme-opt="pink" role="radio" title="Pink theme">Pink</button>
+      </div>
+    </div>
+    <nav class="chips" id="chips" role="group" aria-label="Filter packages">
+      <button class="chip active" data-f="all" data-label="All" aria-pressed="true">All</button>
+      <button class="chip" data-f="attention" data-label="⚠ Attention" aria-pressed="false">⚠ Attention</button>
+      <button class="chip" data-f="transit" data-label="In transit" aria-pressed="false">In transit</button>
+      <button class="chip" data-f="delivered" data-label="Delivered" aria-pressed="false">Delivered</button>
+      <button class="chip" data-f="international" data-label="International" aria-pressed="false">International</button>
+    <button class="chip" id="dirChip" data-f="outgoing" data-label="📤 Outgoing" aria-pressed="false" hidden>📤 Outgoing</button>
+    </nav>
+    <div class="tier-row">
+      <span class="tier-text" id="tierText"></span>
+      <button class="upgrade-btn" id="upgradeBtn">Upgrade to Pro</button>
+    </div>
+  </header>
+  <main id="list">
+    <div class="skel"></div><div class="skel"></div><div class="skel"></div>
+  </main>
+  <footer class="foot" id="foot"><span id="syncLine" role="button" tabindex="0" title="Refresh now">Synced with the bot</span> · <span class="foot-link" id="privLink">🔒 Privacy</span></footer>
+</div>
+
+<div class="sheet" id="addSheet">
+  <div class="sheet-card">
+    <h3>Add package</h3>
+    <input class="field" id="addTid" placeholder="Tracking number" autocomplete="off"
+           autocapitalize="characters" spellcheck="false" inputmode="text">
+    <input class="field" id="addName" placeholder="Name it — e.g. Mom's gift (optional)"
+           autocomplete="off" spellcheck="false" maxlength="64">
+    <div class="dir-seg" id="dirRow" hidden role="group" aria-label="Direction">
+      <button type="button" class="active" id="dirIncoming" data-dir="incoming">📥 Incoming</button>
+      <button type="button" id="dirOutgoing" data-dir="outgoing">📤 Outgoing</button>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn" id="addCancel">Cancel</button>
+      <button class="btn primary" id="addSave">Add package</button>
+    </div>
+    <p class="sheet-hint">USPS · UPS · FedEx · DHL · OnTrac — auto-detected</p>
+  </div>
+</div>
+<div class="sheet" id="shareSheet">
+  <div class="sheet-card">
+    <button class="pro-back" id="shareBack" aria-label="Back to packages">‹ Back</button>
+    <h3 id="shareTitle">Share</h3>
+    <div class="share-url" id="shareUrl" title="Tap to select the link">…</div>
+    <p class="share-life" id="shareLife"></p>
+    <div class="share-grid">
+      <button class="btn primary" id="shareCopy">Copy link</button>
+      <button class="btn" id="shareNative">Share via…</button>
+      <button class="btn" id="shareNew">New link</button>
+      <button class="btn danger" id="shareRevoke">Revoke</button>
+    </div>
+  </div>
+</div>
+
+<div class="sheet" id="proSheet">
+  <div class="sheet-card">
+    <button class="pro-back" id="proBack" aria-label="Back to packages">‹ Back</button>
+    <h3>Upgrade to Pro</h3>
+    <div class="pro-price-big" id="proPriceBig">$1.00</div>
+    <div class="pro-duration" id="proDuration">7 days · USDC / USDT on the Solana network</div>
+    <div class="pro-features-ios">
+      <!-- These numbers carry ids and are re-filled from /api/packages →
+           tier_facts on every load. The baked-in values are only the pre-load
+           fallback, pinned to config by tests/test_miniapp_filters.py — the sheet
+           used to hard-code a schedule (30/60-min delivery-day checks) that the
+           poller had not run for months. -->
+      <div class="feature"><span class="f-label">Track up to <span id="factProPkgs">15</span> packages</span><em><span id="factFreePkgs">5</span> free</em></div>
+      <div class="feature"><span class="f-label">Delivery-day checks every <span id="factProOfd">10 min</span></span><em><span id="factFreeOfd">30 min</span> free</em></div>
+      <div class="feature"><span class="f-label">Automatic checks every <span id="factProTransit">2 h</span></span><em><span id="factFreeTransit">4 h</span> free</em></div>
+      <div class="feature"><span class="f-label">International posts + 17TRACK quota view</span><em><span id="factIntl">5</span> included</em></div>
+      <div class="feature"><span class="f-label">Dark and Pink themes</span><em>Pro only</em></div>
+      <div class="feature"><span class="f-label">Haptic feedback</span><em>Pro only</em></div>
+    </div>
+    <div class="pay-instructions"><b id="payAmount">…</b> · one wallet for USDC and USDT</div>
+    <p class="same-wallet-note" id="payExactNote">One tap opens your wallet with this amount already in it — the link is recognized automatically.</p>
+    <div class="token-picker" role="tablist" aria-label="Payment token">
+      <button class="token-opt active" id="tokUsdc" data-token="USDC">USDC · Solana</button>
+      <button class="token-opt" id="tokUsdt" data-token="USDT">USDT · Solana</button>
+    </div>
+    <!-- Phantom first, and the generic link after it: "phantom://" is answerable by
+         Phantom alone, while the plain Solana Pay link goes to whichever wallet the OS
+         likes — and on iOS no app owns that custom scheme at all (confirmed on the
+         user's iPhone 2026-09-25). So the generic button is a fallback, never the path. -->
+    <button class="btn-copy-ios" id="phantomBtn" style="display:none">Pay with Phantom</button>
+    <button class="btn-open-ios" id="openWalletBtn">Open in my wallet</button>
+    <div class="pay-status-ios" id="payStatus"></div>
+    <div id="qr" class="qr-ios"></div>
+    <div class="qr-caption" id="qrCaption">Or scan with Phantom, Solflare, or any Solana wallet &mdash; from a second device</div>
+    <code class="pay-wallet-ios" id="payWallet" title="Tap to copy">loading…</code>
+    <button class="btn-copy-ios" id="copyWalletBtn">Copy Solana address</button>
+    <p class="warn-chain">Solana network only — do not send Ethereum or Tron USDT/USDC.</p>
+    <p class="same-wallet-note">Nothing opened? <a href="#" id="payPageLink" style="color:var(--text)">Open the payment page</a> — QR and a manual send.</p>
+    <div id="payDepositBlock" style="display:none">
+      <p class="same-wallet-note" style="margin-top:16px"><b>Paying from an exchange?</b> Send any amount of <b>USDC</b> or <b>USDT</b> on Solana to your own address below — the address itself tells us it's you.</p>
+      <code class="pay-wallet-ios" id="payDepositAddr" title="Tap to copy">loading…</code>
+      <button class="btn-copy-ios" id="copyDepositBtn">Copy my personal address</button>
+    </div>
+  </div>
+</div>
+<div class="sheet" id="privSheet">
+  <div class="sheet-card">
+    <h3>🔒 Privacy</h3>
+    <div class="priv-body">
+      <p><b>Stored:</b> your chat ID, the tracking numbers you add, the names on your packages (the ones you set, or the recipient's name read off a label photo), their status history, plus your Pro payment records (amount, token, signature, and the address reserved for you) — encrypted at rest (AES + HMAC) on the bot owner's machine only. Nothing else.</p>
+      <p><b>Shared with:</b> official USPS APIs for USPS numbers; 17TRACK only for international and CN/HK numbers. Pro payments are public on the Solana blockchain: the amount and the receiving address are part of that record, while the wallet memo never carries your chat ID. The personal address the sheet shows you is stable, so payments made to it are linked to one another on-chain — the QR / payment-link route is the unlinked one. No ads, no analytics, no resale.</p>
+      <p><b>In the chat:</b> cards and /list delete themselves a moment after they're sent, and status pings say only that something changed — tracking numbers don't pile up in chat history.</p>
+      <p><b>Updates:</b> automatic and paced per package; delivered ones are never checked again. No refresh buttons — nobody can trigger extra lookups.</p>
+      <p><b>Deleted by you:</b> Remove (one package), /purge (delivered), /clear (everything, instantly). Deletion is immediate and irreversible.</p>
+      <p><b>Deleted for you:</b> delivered packages are forgotten automatically — the bot keeps no tracking number it no longer needs.</p>
+    </div>
+    <div class="sheet-actions">
+      <button class="btn primary" id="privClose">Got it</button>
+    </div>
+  </div>
+</div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+// ── Independent boot watchdog ─────────────────────────────────
+// Deliberately a SEPARATE script block. If the app script below has a
+// syntax error the browser runs NOTHING inside it — not even its own error
+// handling — which is exactly how a broken dashboard once shipped blank and
+// frozen, so a check that parses on its own is the only thing that can still
+// tell the user what happened.
+(function () {
+  var reported = false;
+  function fail(msg) {
+    if (reported) return;
+    reported = true;
+    try { document.getElementById('summary').textContent = '⚠ ' + msg; } catch (e) {}
+    try {
+      document.getElementById('list').innerHTML =
+        '<div class="state"><div class="big">📡</div><h3>Couldn\'t start the app</h3>' +
+        '<p>' + msg + '</p>' +
+        '<p>Force-close Telegram and reopen the app from the bot chat.</p>' +
+        '<button class="btn primary" id="watchdogRetry">Retry</button></div>';
+      document.getElementById('watchdogRetry').onclick = function () {
+        window.location.reload();
+      };
+      // Remember the box: if the app boots anyway (this fired while it was still
+      // starting), the cleanup interval below takes it down instead of leaving
+      // an error screen sitting over a working app.
+      window.__packeyErrorBox = document.getElementById('list').firstElementChild;
+    } catch (e) {}
+  }
+  window.__packeyBootFail = fail;
+  window.addEventListener('error', function (e) {
+    if (!window.__packeyReady) fail((e && e.message) || 'A script error stopped the app');
+  });
+  // The app sets __packeyReady once its boot code has run; if that never
+  // happens the script did not parse (or threw at the top level). One honest
+  // distinction first: a page cut off mid-download has no end marker, so the
+  // app script was never COMPLETE — "reload" beats "syntax error" as the story.
+  setTimeout(function () {
+    if (window.__packeyReady) return;
+    var cut = !document.getElementById('pageEnd');
+    fail(cut ? "The page didn't finish loading — tap retry."
+             : 'The app script never started — likely a syntax error.');
+  }, 5000);
+})();
+</script>
+<script>
+'use strict';
+window.addEventListener('error', (e) => {
+  try {
+    document.getElementById('summary').textContent = '⚠ ' + (e.message || 'Unexpected error');
+  } catch (_) {}
+});
+// ── Boot failure fallback ────────────────────
+// Declared at TOP LEVEL on purpose: 'use strict' is active (line 502), and a
+// function declared inside a block is block-scoped there — the catch-all at
+// the bottom of this script calls bootFailed(), so an inner declaration
+// would throw ReferenceError and mask the real error.
+// The app below runs as one script block: if ANY early statement throws
+// (a bridge call on an old client, a missing DOM node, anything), the page
+// would sit blank with no message. Say so loudly, with a retry.
+function bootFailed(msg) {
+  // The script parsed and handled its own failure: tell the watchdog block so
+  // it doesn't overwrite this specific message with its generic one.
+  window.__packeyReady = true;
+  try { document.getElementById('summary').textContent = '⚠ ' + msg; } catch (_) {}
+  try {
+    document.getElementById('list').innerHTML =
+      '<div class="state"><div class="big">📡</div><h3>Couldn\'t start the app</h3>' +
+      '<p>' + msg + '</p>' +
+      '<p>Force-close Telegram and reopen the app from the bot chat.</p>' +
+      '<button class="btn primary" id="bootRetry">Retry</button></div>';
+    document.getElementById('bootRetry').onclick = () => window.location.reload();
+  } catch (_) {}
+}
+
+const T = (window.Telegram && window.Telegram.WebApp) ? window.Telegram.WebApp : null;
+
+// ── Shared utilities (BOTH surfaces) ─────────────────────────────────────────
+// These were inside the Telegram-only branch below, which made them undefined
+// in a browser: tapping 🔒 Privacy on the landing called hap() and died with
+// "ReferenceError: hap is not defined" — the sheet never opened (found
+// 2026-09-28, live in Safari + desktop). Every page the server can hand out
+// (app, landing, and the sheets that exist on both) needs these, so they live
+// ABOVE the split now. tg-references became T-references: T is defined here,
+// the branch-local `const tg = T` is not — and hap's own guards make T null
+// (a browser) a no-op instead of a throw.
+const esc = (s) => { const d = document.createElement('div');
+  d.textContent = s == null ? '' : String(s);
+  // textContent->innerHTML escapes & < > but not quotes. esc() also sits
+  // inside double-quoted attributes (href/title on the carrier link), where
+  // an unescaped quote could break out of the attribute — so quotes are
+  // escaped too (2026-10-04 audit). In text positions the entities render
+  // identically. The \x escapes are the same characters, spelled with hex escapes so the repo quote-balance linter does not mistake the regex delimiters for string quotes.
+  return d.innerHTML.replace(/\x22/g, "&quot;").replace(/\x27/g, "&#39;"); };
+
+let tier = { pro: false, pkg_limit: 3, retention_days: 0, facts: null };
+
+const hap = (style) => {
+  if (!T || !tier.pro) return;  // no bridge (browser) or not Pro: silent no-op
+  try { T.HapticFeedback && T.HapticFeedback.impactOccurred(style); } catch (_) {}
+};
+
+let toastTimer = null;
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove('show'), 2400);
+}
+
+async function api(path, opts = {}, timeoutMs = 20000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    let res;
+    try {
+      res = await fetch(path, {
+        headers: { 'Authorization': 'tma ' + ((T && T.initData) || ''),
+                   'Content-Type': 'application/json' },
+        signal: ctrl.signal,
+        ...opts,
+      });
+    } catch (e) {
+      // No response at all (dead tunnel, DNS gone, offline): never let this
+      // masquerade as "still working". Name the most common cause outright.
+      const err = new Error('unreachable');
+      err.unreachable = true;
+      throw err;
+    }
+    if (res.status === 401) {
+      // initData is a short-lived bearer token (config.INIT_DATA_MAX_AGE): a
+      // dashboard left open past the window starts failing like this. A reload
+      // makes Telegram hand the webview a fresh signature, so self-heal once
+      // instead of showing an error the user can't act on. In a BROWSER this
+      // fires too (the landing's privacy fetch): no initData exists at all, the
+      // reload would loop — so the once-guard keeps it to a single reload, and
+      // the thrown message lands in the sheet's local-fallback catch.
+      let reloaded = false;
+      try { reloaded = sessionStorage.getItem('initDataReload') === '1'; } catch (_) {}
+      if (!reloaded && T && T.initData) {
+        try { sessionStorage.setItem('initDataReload', '1'); } catch (_) {}
+        location.reload();
+        throw new Error('Refreshing your session…');
+      }
+      throw new Error('Session expired — reopen the app from the bot menu.');
+    }
+    // Tolerate a non-JSON body (e.g. aiohttp's plain 404 for a route that the
+    // running bot does not have yet) so callers can read res.status.
+    let data = {};
+    try { data = await res.json(); } catch (_) { data = {}; }
+    if (!res.ok) {
+      const err = new Error(data.error || res.statusText);
+      if (data.limit_reached) err.limitReached = true;
+      if (data.intl_limit) err.intlLimit = true;
+      if (data.pro_only) err.proOnly = true;
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  } catch (e) {
+    // Abort = the server is alive but slow (long USPS lookup): keep polling
+    // language. A flagged unreachable error = there IS no server: say so.
+    if (e.name === 'AbortError') throw new Error('Still checking — USPS lookups can take up to a minute. Try again shortly.');
+    if (e.unreachable) throw new Error("Can't reach the server — send /start in the bot chat and open the app from the new message.");
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Privacy sheet (wired on BOTH surfaces) ─────────────
+// The footer's 🔒 link is on every page INCLUDING the browser landing, but this
+// wiring used to live inside the Telegram-only branch below — so a desktop
+// visitor's Privacy link rendered and did nothing (found 2026-09-28). The policy
+// itself is written once, in the bot (ui.PRIVACY_TEXT) and served at
+// /api/privacy, so this sheet can never promise something /privacy doesn't; the
+// markup in the HTML is the offline fallback. In a browser the fetch 401s (no
+// initData) and the sheet simply keeps that local copy — the built-in
+// degradation the catch below was written for.
+const privSheet = document.getElementById('privSheet');
+async function loadPrivacy() {
+  const body = privSheet.querySelector('.priv-body');
+  if (!body) return;
+  try {
+    const r = await api('/api/privacy', {}, 8000);
+    if (r && r.html) {
+      body.innerHTML = r.html
+        .split('\n\n')
+        .map(p => '<p>' + p.replace(/\n/g, '<br>') + '</p>')
+        .join('');
+    }
+  } catch (_) { /* keep the local copy — never block the sheet on a fetch */ }
+}
+document.getElementById('privLink').onclick = () => {
+  hap('light');
+  privSheet.classList.add('open');
+  loadPrivacy();
+};
+document.getElementById('privClose').onclick = () => { hap('light'); privSheet.classList.remove('open'); };
+privSheet.addEventListener('click', (e) => { if (e.target === privSheet) privSheet.classList.remove('open'); });
+// telegram-web-app.js loads in ANY browser, so the WebApp object is not proof of
+// being inside Telegram: it exists in plain Safari too, with an EMPTY initData.
+// Gating on the object (the old `if (!T)`) only caught "the script failed to
+// load" — a browser visitor booted a half-app instead: every api() call 401s
+// (there is no initData to sign with) and the Pro sheet's QR box sat on
+// "Preparing QR…" forever.
+const inTelegram = !!(T && T.initData);
+if (!inTelegram) {
+  // Opened outside Telegram: this is the ONE page a stranger may ever land on —
+  // a shared link, or someone typing the bare domain. So it carries the product
+  // intro: what Packey is, what the app looks like (a demo card in the app's own
+  // CSS), and the way in. The link is the bot's verified username. Every number
+  // in the copy is a baked-in fallback pinned to config by test_copy_truth.py.
+  document.getElementById('summary').textContent = 'Open in Telegram';
+  // Skeletons read as "still loading" — on the landing there is nothing loading,
+  // so kill the shimmer or the page looks like an app that failed to start.
+  try { document.getElementById('list').innerHTML = ''; } catch (_) {}
+  document.getElementById('list').innerHTML =
+    '<div class="state landing">' +
+
+    '<div class="landing-hero">' +
+    '<div class="big">📦</div>' +
+    '<h3>Packey — package tracking that lives in Telegram</h3>' +
+    '<p class="lede">Send a tracking number. Packey detects the carrier, watches ' +
+    'it, and pings you the moment it moves — the ping never says <i>what</i> ' +
+    'moved, only that something did, so nothing sensitive lands in a chat other ' +
+    'people can read.</p>' +
+    '<a class="btn primary" href="https://t.me/packeybot">Open in Telegram</a>' +
+    '<p class="qr-hint">Open Packey in Telegram on your phone — or scan:</p>' +
+    '<div class="landing-qr" id="landingQr"></div>' +
+    '</div>' +
+
+    '<hr>' +
+    '<div class="section-h">This is what you\'ll see</div>' +
+    '<article class="card demo">' +
+    '<div class="accent"></div>' +
+    '<div class="card-head">' +
+    '<div class="title-wrap"><h2 class="title">Mom\'s gift</h2></div>' +
+    '<span class="badge" style="--ac:#4f9cff;--ac-soft:rgba(79,156,255,.18)">In Transit</span>' +
+    '<span class="chev" aria-hidden="true">›</span>' +
+    '</div>' +
+    '<div class="route">' +
+    '<span class="node hit"></span><span class="rail hit"></span>' +
+    '<span class="node hit cur"></span><span class="rail"></span>' +
+    '<span class="node"></span><span class="rail"></span>' +
+    '<span class="node"></span></div>' +
+    '<div class="route-labels"><span>Label</span><span>Transit</span>' +
+    '<span>Out for delivery</span><span>Delivered</span></div>' +
+    '<p class="detail">Departed the sorting facility — moving again</p>' +
+    '<p class="meta"><b>USPS</b> · checked just now · next in ~2 h</p>' +
+    '</article>' +
+    '<p class="landing-note">A real card, live in the app — with your packages.</p>' +
+
+    '<hr>' +
+    '<div class="section-h">Why Packey</div>' +
+    '<ul>' +
+    '<li>🏷️ <b>Paste or snap</b> — a tracking number, or a photo of the label: ' +
+    'the number is read from its barcode and nothing else</li>' +
+    '<li>🚚 <b>Carriers auto-detected</b> — USPS, UPS, FedEx, DHL and OnTrac free; ' +
+    '3,000+ carriers worldwide with Pro</li>' +
+    '<li>🔔 <b>Pings that say nothing</b> — "one of your packages changed" plus a ' +
+    'link. No number, no name, no status — groups included</li>' +
+    '<li>🔒 <b>Privacy by default</b> — encrypted at rest, delivered packages ' +
+    'forgotten after 14 days, nothing ever sold. The bot\'s <code>/privacy</code> ' +
+    'has the honest version</li>' +
+    '</ul>' +
+
+    '<hr>' +
+    '<div class="section-h">How it works</div>' +
+    '<ol>' +
+    '<li>Open the bot in Telegram</li>' +
+    '<li>Send a tracking number — or a photo of the label</li>' +
+    '<li>Get pinged when it moves; the app shows the details</li>' +
+    '</ol>' +
+
+    '<hr>' +
+    '<div class="section-h">Questions</div>' +
+    '<ul>' +
+    '<li><b>Is my data sold or shared?</b> No advertisers, no analytics, no resale — ever.</li>' +
+    '<li><b>Where does it live?</b> Encrypted (AES + HMAC) on the bot owner\'s machine; the log masks identifiers.</li>' +
+    '<li><b>What does Pro cost?</b> $1 per week — 15 packages, faster checks, international posts, themes.</li>' +
+    '<li><b>Why can\'t the app run here?</b> It signs you in through Telegram — this page is just the door.</li>' +
+    '</ul>' +
+
+    '</div>';
+
+  // The QR opens the bot on a phone, for a visitor sitting at a desktop. The
+  // vendor script is DEFERRED, so it runs after this inline block — draw on the
+  // load event, and skip silently when it failed to load (the button above is
+  // the fallback; the existing "QR unavailable" guard style).
+  var qrHost = document.getElementById('landingQr');
+  var drawLandingQr = function () {
+    if (!qrHost || !window.QRCode || typeof QRCode.toCanvas !== 'function') return;
+    var c = document.createElement('canvas');
+    qrHost.innerHTML = '';
+    qrHost.appendChild(c);
+    try {
+      QRCode.toCanvas(c, 'https://t.me/packeybot',
+        { width: 148, margin: 1, errorCorrectionLevel: 'M',
+          color: { dark: '#111111', light: '#ffffff' } },
+        function (e) { if (e) qrHost.innerHTML = ''; });
+    } catch (_) { qrHost.innerHTML = ''; }
+  };
+  if (window.QRCode) drawLandingQr();
+  else window.addEventListener('load', drawLandingQr);
+
+  // The boot handshake: the watchdog's 5s timer checks __packeyReady on EVERY
+  // page — including this one — and replaces #list wholesale when it is still
+  // falsy. Without this line the intro renders for ~5 seconds and then the
+  // watchdog destroys it with "Couldn't start the app / script never started",
+  // which is exactly the report from the field (desktop + mobile, 2026-09-28).
+  // Nothing more is coming on this page: mark it booted.
+  window.__packeyReady = true;
+} else {
+try {
+const tg = T;
+try { tg.ready(); } catch (_) {}   // never let a bridge call kill the page
+try { tg.expand(); } catch (_) {}
+
+const listEl = document.getElementById('list');
+let filter = 'all';
+let cache = [];
+// tier lives in the SHARED section above (hap reads it on both surfaces).
+let appStatus = null;
+// next_check_in arrives for EVERY user (top level) even though the full
+// status object is owner-only: the poll loop spaces itself by it.
+let pollHint = null;
+
+const STATUS_COLORS = {
+  'Delivered':            '#34d186',
+  'In Transit':           '#4f9cff',
+  'Out for Delivery':     '#ffa94d',
+  'Available for Pickup': '#ffd166',
+  'Delivery Attempted':   '#ff8f5e',
+  'Exception':            '#ff5c5c',
+  'Info Received':        '#b78bff',
+  'Pending':              '#8b98a5',
+  'Unavailable':          '#8b98a5',
+};
+// esc / tier / hap / toast / api live in the SHARED section above the branch
+// split — see the utilities block after `const T`.
+
+function fmtRel(iso) {
+  if (!iso) return '—';
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (isNaN(s)) return '—';
+  if (s < 45) return 'just now';
+  if (s < 3600) return Math.max(1, Math.round(s / 60)) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+
+// Forward-looking counterpart to fmtRel: when the bot will look again.
+function fmtIn(seconds) {
+  if (seconds == null) return '';
+  if (seconds < 45) return 'now';
+  if (seconds < 3600) return '~' + Math.max(1, Math.round(seconds / 60)) + 'm';
+  return '~' + (Math.round(seconds / 3600)) + 'h';
+}
+
+function group(p) {
+  if (p.status === 'Delivered') return 'delivered';
+  if (p.status === 'Exception' || p.status === 'Delivery Attempted') return 'attention';
+  return 'transit';
+}
+
+function needsAttention(p) {
+  return group(p) === 'attention';
+}
+
+// 🌍 International lane — national posts that only 17TRACK can check. Keep in
+// sync with _is_international in miniapp.py (the server is authoritative for
+// the view's contents; this rule drives the chip count and the fallback).
+const INTL_SLUGS = ['chinapost', 'hkpost', 'intl'];
+const INTL_COUNTRIES = ['CN', 'HK'];
+function isIntl(p) {
+  if (INTL_SLUGS.includes(p.carrier)) return true;
+  return INTL_COUNTRIES.includes((p.carrier_country || '').toUpperCase());
+}
+
+// Fallback only: the server sends the live allowance in tier_facts.intl_included
+// (config.PRO_INTL_LIMIT) and applyTierFacts() overwrites this on every load.
+// tests/test_intl_limit.py fails if this baked-in value drifts from config.
+let INTL_TOTAL = 5;
+
+// Pro-only international payload: packages + the 17TRACK quota they spend.
+let intlState = { loaded: false, loading: false, error: null, packages: [], quota: null };
+
+function quotaCard(q) {
+  if (!q || !q.known) {
+    return `<div class="card quota"><div class="quota-head">
+        <span class="quota-title">17TRACK API quota</span>
+        <span class="quota-pct">—</span>
+      </div><p class="quota-note">No quota reading yet — it refreshes hourly, or on demand.</p></div>`;
+  }
+  const pct = Math.max(0, Math.min(100, Number(q.percent) || 0));
+  const color = pct >= 85 ? '#ff5c5c' : (pct >= 70 ? '#ffa94d' : '#34d186');
+  const left = (q.total != null && q.used != null) ? `${q.used.toLocaleString()} of ${q.total.toLocaleString()} used` : `${pct}% used`;
+  return `<div class="card quota" style="--ac:${color}">
+      <div class="quota-head">
+        <span class="quota-title">17TRACK API quota</span>
+        <span class="quota-pct">${pct}%</span>
+      </div>
+      <div class="bar" role="img" aria-label="17TRACK quota ${pct} percent used"><i style="width:${pct}%"></i></div>
+      <p class="quota-note">${esc(left)} · your international packages are the ones that need it.${
+        pct >= 85 ? ' Running low — non-essential checks are paused until it resets.' : ''}</p>
+    </div>`;
+}
+
+// Retention is a promise, so the dashboard repeats it: a delivered card says
+// how long it has left before the bot forgets it entirely.
+function retentionNote(p) {
+  if (p.status !== 'Delivered' || !tier.retention_days) return '';
+  const t = Date.parse(p.last_updated || p.last_checked || '');
+  if (!t) return '';
+  const left = Math.ceil((t + tier.retention_days * 86400000 - Date.now()) / 86400000);
+  if (left <= 0) return `<p class="blocked-note">🧹 <b>Forgotten automatically</b> — the next cleanup pass removes this package and its number.</p>`;
+  return `<p class="blocked-note">🧹 <b>Auto-forgets in ${left} day${left === 1 ? '' : 's'}</b> — the bot keeps no tracking number it no longer needs.</p>`;
+}
+
+// Explicit per-status rail position: only real progression earns a step, so a
+// problem or an unknown state can never masquerade as in-transit. Keys mirror
+// STATUS_COLORS; tests/test_miniapp_contract.py pins the two together.
+const ROUTE_STEP = {
+  'Pending':              1,
+  'Info Received':        1,
+  'Unavailable':          1,
+  'In Transit':           2,
+  'Delivery Attempted':   2,
+  'Out for Delivery':     3,
+  'Available for Pickup': 3,
+  'Delivered':            4,
+  'Exception':            null,
+};
+
+function routeStep(status) {
+  return Object.prototype.hasOwnProperty.call(ROUTE_STEP, status)
+    ? ROUTE_STEP[status] : null;
+}
+
+function routeMarkup(p) {
+  const step = routeStep(p.status);
+  if (step === null) return '';   // never claim progress we do not know
+  const nodes = [1, 2, 3, 4].map(n =>
+    `<span class="node${n <= step ? ' hit' : ''}${n === step ? ' cur' : ''}"></span>`);
+  const rails = [1, 2, 3].map(n =>
+    `<span class="rail${n < step ? ' hit' : ''}"></span>`);
+  const body = nodes[0] + rails[0] + nodes[1] + rails[1] + nodes[2] + rails[2] + nodes[3];
+  return `<div class="route">${body}</div>
+    <div class="route-labels"><span>Label</span><span>Transit</span><span>Out for delivery</span><span>Delivered</span></div>`;
+}
+
+function sourceLabel(s) {
+  const m = /^(.+) Browser$/.exec(s || '');
+  return m ? 'live from ' + m[1] : (s || '');
+}
+
+function renderCard(p) {
+  const ac = STATUS_COLORS[p.status] || '#8b98a5';
+  const soft = ac + '24';
+  const div = document.createElement('article');
+  div.className = 'card' + (p.status === 'Delivered' ? ' done' : '') +
+    (group(p) === 'attention' ? ' attention' : '');
+  div.style.setProperty('--ac', ac);
+  div.style.setProperty('--ac-soft', soft);
+  div.dataset.tid = p.tracking_id;
+  const badge = (() => {
+    // An outgoing parcel's "Delivered" means it reached its destination — this
+    // label and the direction badge are the only places the app says so.
+    const label = (p.status === 'Delivered' && p.direction === 'outgoing')
+      ? 'Delivered — arrived at its destination' : p.status;
+    return `<span class="badge">${esc(label)}${p.stale ? ' · last known' : ''}${p.muted ? ' · muted' : ''}</span>`
+      + (p.direction === 'outgoing' ? '<span class="badge badge-dir">📤 Outgoing</span>' : '');
+  })();
+  div.innerHTML = `
+    <div class="accent"></div>
+    <div class="card-head">
+      <div class="title-wrap">
+        <h2 class="title">${esc(p.name)}</h2>
+        <button class="mini-btn rename" title="Rename">✎</button>
+        ${tier.pro ? `<button class="mini-btn dirbtn" title="${p.direction === 'outgoing' ? 'Mark incoming' : 'Mark outgoing'}">${p.direction === 'outgoing' ? '📥' : '📤'}</button>` : ''}
+      </div>
+      ${badge}<span class="chev" aria-hidden="true">›</span>
+    </div>
+    ${p.character_line ? `<p class="character">“${esc(p.character_line)}”</p>` : ''}
+    <div class="tid-row">
+      ${p.carrier_url
+        ? `<a class="tid" href="${esc(p.carrier_url)}" target="_blank" rel="noopener noreferrer" title="Open ${esc(p.carrier_name)} tracking">${esc(p.tracking_id)}</a>`
+        : `<code class="tid">${esc(p.tracking_id)}</code>`}
+      <button class="copy" title="Copy tracking number">⧉</button>
+    </div>
+    ${routeMarkup(p)}
+    ${p.detail ? `<p class="detail">${esc(p.detail)}</p>` : ''}
+    ${p.register_blocked ? `<p class="blocked-note">⏳ <b>Waiting for the carrier's first scan</b> — ${esc(p.carrier_name || 'this carrier')} can't show this number yet. It will start updating automatically once scanned.</p>` : ''}
+    ${p.needs_pro ? `<p class="blocked-note">🌍 <b>Updates paused — this carrier needs Pro.</b> The status above is the last known one; it resumes automatically on Pro.</p>` : ''}
+    ${retentionNote(p)}
+    <p class="meta"><b>${esc(p.carrier_name)}</b>${p.source ? ' · ' + esc(sourceLabel(p.source)) : ''} · checked ${esc(fmtRel(p.last_checked || p.last_updated))}${p.next_check_in != null ? ' · next ' + esc(fmtIn(p.next_check_in)) : ''}</p>
+    <div class="actions">
+      <button class="btn act-share">🔗 Share</button>
+      <button class="btn act-mute">${p.muted ? '🔔 Unmute' : '🔕 Mute'}</button>
+    </div>
+    <div class="actions secondary">
+      <button class="btn act-porch">${p.porch_guard ? '🔕 Porch guard off' : '🔔 Porch guard on'}</button>
+      <button class="btn danger act-remove">Remove</button>
+    </div>
+  `;
+  wireCard(div, p);
+  return div;
+}
+
+function wireCard(div, p) {
+  // Card-level toggle: taps on the card body collapse/expand the action row.
+  // Links and buttons (open-carrier, copy, share, rename, mute, porch, remove)
+  // keep their own handlers and must never toggle the card.
+  div.addEventListener('click', (e) => {
+    if (e.target.closest('a,button')) return;
+    div.classList.toggle('open');
+  });
+  div.querySelector('.rename').onclick = () => {
+    hap('light');
+    const wrap = div.querySelector('.title-wrap');
+    const oldHtml = wrap.innerHTML;
+    wrap.innerHTML = '';
+    const input = document.createElement('input');
+    input.className = 'title-input';
+    input.value = p.name;
+    input.maxLength = 64;
+    const ok = document.createElement('button');
+    ok.className = 'mini-btn'; ok.textContent = '✓';
+    const no = document.createElement('button');
+    no.className = 'mini-btn'; no.textContent = '✕';
+    wrap.append(input, ok, no);
+    input.focus(); input.select();
+    const cancel = () => { wrap.innerHTML = oldHtml; wireCard(div, p); };
+    no.onclick = cancel;
+    ok.onclick = async () => {
+      const name = input.value.trim();
+      if (!name) { toast("Name can't be empty"); return; }
+      hap('medium');
+      try {
+        const r = await api('/api/rename', {
+          method: 'POST',
+          body: JSON.stringify({ tracking_id: p.tracking_id, name }),
+        });
+        Object.assign(p, r.package);
+        toast('Renamed');
+        div.replaceWith(renderCard(p));
+      } catch (e) { toast(e.message); }
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') ok.onclick();
+      if (e.key === 'Escape') cancel();
+    });
+  };
+
+  div.querySelector('.copy').onclick = () => {
+    hap('light');
+    const done = () => toast('Tracking number copied');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(p.tracking_id).then(done, () => toast('Copy failed'));
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = p.tracking_id; document.body.appendChild(ta);
+      ta.select(); document.execCommand('copy'); ta.remove(); done();
+    }
+  };
+
+  const dirBtn = div.querySelector('.dirbtn');
+  if (dirBtn) {
+    // Pro only (the button is not rendered for a free chat; the API 403s too).
+    dirBtn.onclick = async () => {
+      hap('light');
+      try {
+        const r = await api('/api/direction', {
+          method: 'POST',
+          body: JSON.stringify({
+            tracking_id: p.tracking_id,
+            direction: p.direction === 'outgoing' ? 'incoming' : 'outgoing',
+          }),
+        });
+        div.replaceWith(renderCard(r.package));
+        refreshChips();
+        toast(r.package.direction === 'outgoing' ? 'Marked outgoing' : 'Marked incoming');
+      } catch (e) { toast(e.message); }
+    };
+  }
+
+  div.querySelector('.act-porch').onclick = async () => {
+    hap('light');
+    try {
+      // Not Pro-gated (unlike the direction button): the app sends the state it
+      // wants, so a double-tap cannot land opposite to what the card showed.
+      const r = await api('/api/porch', {
+        method: 'POST',
+        body: JSON.stringify({
+          tracking_id: p.tracking_id,
+          enabled: !p.porch_guard,
+        }),
+      });
+      div.replaceWith(renderCard(r.package));
+      refreshChips();
+      toast(r.package.porch_guard ? 'Porch Guard on' : 'Porch Guard off');
+    } catch (e) { toast(e.message); }
+  };
+
+  div.querySelector('.act-share').onclick = () => openShareSheet(p);
+
+  div.querySelector('.act-mute').onclick = async () => {
+    hap('light');
+    try {
+      const r = await api('/api/mute', {
+        method: 'POST', body: JSON.stringify({ tracking_id: p.tracking_id }),
+      });
+      div.replaceWith(renderCard(r.package));
+      refreshSummary();
+      toast(r.package.muted ? 'Notifications muted' : 'Notifications on');
+    } catch (e) { toast(e.message); }
+  };
+
+  div.querySelector('.act-remove').onclick = () => {
+    hap('medium');
+    tg.showConfirm(`Remove "${p.name}"?`, async (ok) => {
+      if (!ok) return;
+      try {
+        await api('/api/remove', {
+          method: 'POST', body: JSON.stringify({ tracking_id: p.tracking_id }),
+        });
+        removeCard(div, p);
+        toast('Package removed');
+      } catch (e) {
+        if ((e.message || '').includes('not found')) {
+          // Stale card — the package is already gone server-side.
+          removeCard(div, p);
+          toast('Already removed');
+          if (typeof load === 'function') load(false);
+        } else {
+          toast(e.message);
+        }
+      }
+    });
+  };
+
+  // One removal path for both the confirmed remove and the stale-card case: the
+  // card leaves the DOM AND the cache, then every counter that reads the cache
+  // is refreshed — summary, chips, and the section header. Before this, only the
+  // summary was refreshed and the CACHE was never touched, so "N delivered"
+  // headers and the chip counts kept counting a package that was gone until the
+  // next full load.
+  function removeCard(el, pkg) {
+    cache = cache.filter(q => q.tracking_id !== pkg.tracking_id);
+    // The 🌍 view keeps its own list (server-shaped objects) — keep it in step.
+    intlState.packages = intlState.packages.filter(
+      q => q.tracking_id !== pkg.tracking_id);
+    el.remove();
+    updateSectionCount(group(pkg));
+    refreshChips();
+    refreshSummary();
+    // A filter whose last item just left shows its empty state, not a blank page.
+    if (filter === 'international') {
+      if (!intlState.packages.length) render();
+    } else if (filter !== 'all') {
+      const still = cache.some(q => filter === 'outgoing'
+        ? q.direction === 'outgoing' : group(q) === filter);
+      if (!still) render();
+    }
+  }
+}
+const SECTIONS = [
+  ['attention', 'Needs attention'],
+  ['transit',  'In transit'],
+  ['delivered','Delivered'],
+];
+
+// The bulk clear — the phone-friendly twin of /purge. Built as a helper so BOTH
+// places that show it (the All view's Delivered header and the Delivered filter)
+// share one implementation, and so the confirm reads the DELIVERED COUNT at
+// click time: a count captured at render time goes stale the moment any
+// delivered package is removed (the header count did exactly that).
+function clearDeliveredButton() {
+  const btn = document.createElement('button');
+  btn.className = 'mini-btn clear-delivered';
+  btn.textContent = 'Clear';
+  btn.onclick = () => {
+    const items = cache.filter(q => group(q) === 'delivered');
+    if (!items.length) return;
+    tg.showConfirm(`Remove ${items.length} delivered packages?`, async (ok) => {
+      if (!ok) return;
+      const errs = [];
+      for (const q of items) {
+        try {
+          await api('/api/remove', { method: 'POST',
+            body: JSON.stringify({ tracking_id: q.tracking_id }) });
+        } catch (e) {
+          if (!(e.message || '').includes('not found')) {
+            errs.push(e.message || 'failed');
+          }
+        }
+      }
+      load(true);
+      toast(errs.length ? 'Some failed to clear: ' + errs[0]
+                        : 'Cleared delivered packages');
+    });
+  };
+  return btn;
+}
+
+// One place updates a section header's count after an in-place change, so the
+// "Delivered · N" heading never outlives the cards under it. The Clear button
+// (a child node) must survive, so only the leading text node is rewritten.
+function updateSectionCount(key) {
+  const h = listEl.querySelector(`.section-h[data-key="${key}"]`);
+  if (!h) return;
+  const left = cache.filter(q => group(q) === key).length;
+  if (!left) { h.remove(); return; }
+  const label = (SECTIONS.find(s => s[0] === key) || [null, key])[1];
+  if (h.firstChild && h.firstChild.nodeType === 3) {
+    h.firstChild.textContent = `${label} · ${left}`;
+  } else {
+    h.textContent = `${label} · ${left}`;
+  }
+}
+
+function refreshSummary() {
+  const el = document.getElementById('summary');
+  if (!cache.length) { el.textContent = 'Nothing tracked yet'; return; }
+  const n = { attention: 0, transit: 0, delivered: 0 };
+  cache.forEach(p => n[group(p)]++);
+  const parts = [];
+  if (n.attention) parts.push(`⚠ ${n.attention} need${n.attention === 1 ? 's' : ''} attention`);
+  if (n.transit) parts.push(`${n.transit} in transit`);
+  if (n.delivered) parts.push(`${n.delivered} delivered`);
+  const paused = cache.filter(p => p.needs_pro).length;
+  if (paused) parts.push(`${paused} paused (Pro)`);
+  el.textContent = parts.join(' · ') || 'All quiet';
+}
+
+// Counts ride on the filter chips (same single-letter style as sections).
+function refreshChips() {
+  const n = { attention: 0, transit: 0, delivered: 0 };
+  cache.forEach(p => n[group(p)]++);
+  const intl = cache.filter(isIntl).length;
+  const outgoing = cache.filter(p => p.direction === 'outgoing').length;
+  document.querySelectorAll('#chips .chip').forEach((c) => {
+    const f = c.dataset.f;
+    const label = c.dataset.label;
+    if (f === 'all') {
+      c.textContent = `${label} · ${cache.length}`;
+    } else if (f === 'international') {
+      c.textContent = intl ? `${label} · ${intl}` : label;
+    } else if (f === 'outgoing') {
+      c.textContent = outgoing ? `${label} · ${outgoing}` : label;
+    } else if (f in n) {
+      c.textContent = n[f] ? `${label} · ${n[f]}` : label;
+    }
+  });
+}
+
+function render() {
+  if (filter === 'international') { renderInternational(); refreshChips(); refreshSummary(); return; }
+  const visible = cache.filter(p => filter === 'all' ? true
+    : filter === 'outgoing' ? p.direction === 'outgoing'
+    : group(p) === filter);
+  listEl.innerHTML = '';
+  refreshChips();
+  if (!visible.length) {
+    listEl.innerHTML = filter === 'all'
+      ? `<div class="state"><div class="big">📦</div>
+           <h3>No packages yet</h3>
+           <p>Tap <b>＋</b> and paste a tracking number — or send <code>/track 9400…</code> in the chat.</p></div>`
+      : `<div class="state"><div class="big">🗂️</div>
+           <h3>Nothing here</h3>
+           <p>No packages match this filter right now.</p></div>`;
+    refreshSummary();
+    return;
+  }
+  if (filter === 'all') {
+    SECTIONS.forEach(([key, label]) => {
+      const items = visible.filter(p => group(p) === key);
+      if (!items.length) return;
+      const h = document.createElement('div');
+      h.className = 'section-h' + (key === 'attention' ? ' attention-h' : '');
+      h.dataset.key = key;                 // updateSectionCount() finds it by this
+      h.textContent = `${label} · ${items.length}`;
+      if (key === 'delivered' && items.length) {
+        h.appendChild(clearDeliveredButton());
+      }
+      listEl.appendChild(h);
+
+      items.forEach(p => listEl.appendChild(renderCard(p)));
+    });
+  } else {
+    if (filter === 'delivered' && visible.length) {
+      // The dedicated Delivered filter gets the same bulk clear as the All
+      // view's Delivered section — the inconsistency where the twin of /purge
+      // existed on one path only.
+      const h = document.createElement('div');
+      h.className = 'section-h';
+      h.dataset.key = 'delivered';
+      h.textContent = `Delivered · ${visible.length}`;
+      h.appendChild(clearDeliveredButton());
+      listEl.appendChild(h);
+    }
+    visible.forEach(p => listEl.appendChild(renderCard(p)));
+  }
+  refreshSummary();
+}
+
+async function loadInternational() {
+  if (intlState.loading) return;
+  intlState.loading = true;
+  intlState.error = null;
+  render();
+  try {
+    const r = await api('/api/international', {}, 15000);
+    intlState.packages = r.packages || [];
+    intlState.quota = r.quota || null;
+    // The member's own tally (intl_used) is what the add gate enforces; the
+    // stored-package count is only a fallback for an older server payload.
+    intlState.intl_used = (typeof r.intl_used === 'number') ? r.intl_used : null;
+    intlState.loaded = true;
+  } catch (e) {
+    // A bot that predates this endpoint answers 404, and a Pro expiry answers
+    // 403 — degrade to the local filter instead of an error the user can't act on.
+    intlState.packages = cache.filter(isIntl);
+    intlState.loaded = true;
+    intlState.error = (e && (e.status === 404 || e.proOnly))
+      ? 'unavailable'
+      : (e && e.message) || 'Could not load';
+    if (e && e.proOnly) { tier.pro = false; applyTierUI(); }
+  }
+  intlState.loading = false;
+  render();
+}
+
+function renderInternational() {
+  listEl.innerHTML = '';
+  if (!tier.pro) {
+    listEl.innerHTML = `<div class="state"><div class="big">🌍</div>
+        <h3>International is a Pro view</h3>
+        <p>Track packages from national posts (China Post, Hongkong Post and
+        other countries) and see the 17TRACK quota they use.</p>
+        <button class="btn primary" id="intlUpgrade">Upgrade to Pro</button></div>`;
+    const up = document.getElementById('intlUpgrade');
+    if (up) up.onclick = openProSheet;
+    return;
+  }
+  if (intlState.loading) {
+    listEl.innerHTML = '<div class="skel"></div><div class="skel"></div>';
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.innerHTML = quotaCard(intlState.quota);
+  listEl.appendChild(wrap.firstElementChild);
+  // The tab's own add button: the same add sheet, hinted for international
+  // numbers — the server classifies the format and applies the 5/period gate.
+  const addBtn = document.createElement('button');
+  addBtn.className = 'btn primary';
+  addBtn.textContent = '＋ Add international package';
+  addBtn.style.cssText = 'width:100%;margin:10px 0 2px;';
+  addBtn.onclick = () => { hap('light'); openAddSheet(true); };
+  listEl.appendChild(addBtn);
+  if (intlState.error === 'unavailable') {
+    const note = document.createElement('div');
+    note.className = 'state';
+    note.innerHTML = `<div class="big">↻</div><h3>Quota needs a bot restart</h3>
+        <p>This list is built from your packages on this device. Restart the bot
+        to load the live 17TRACK quota.</p>`;
+    listEl.appendChild(note);
+  } else if (intlState.error) {
+    const note = document.createElement('div');
+    note.className = 'state';
+    note.innerHTML = `<div class="big">📡</div><h3>Couldn't load</h3><p>${esc(intlState.error)}</p>`;
+    listEl.appendChild(note);
+  }
+  if (!intlState.packages.length) {
+    const h = document.createElement('div');
+    h.className = 'state';
+    h.innerHTML = `<div class="big">🌍</div><h3>No international packages</h3>
+        <p>Numbers from China Post, Hongkong Post and other national posts
+        appear here — add one below.</p>`;
+    listEl.appendChild(h);
+    return;
+  }
+  const head = document.createElement('div');
+  head.className = 'section-h';
+  head.textContent = `Cross-border · ${intlState.packages.length}`;
+  listEl.appendChild(head);
+  // How much of the Pro international allowance this chat is using: the
+  // registration tally (what the add gate spends), not the stored count —
+  // a removed package must still show its spent slot until the period resets.
+  const allow = document.createElement('p');
+  allow.className = 'quota-note';
+  const used = (intlState.intl_used != null)
+    ? intlState.intl_used : intlState.packages.length;
+  allow.textContent = `Your plan includes ${INTL_TOTAL} international ` +
+    `package${INTL_TOTAL === 1 ? '' : 's'} — ` +
+    `${used} registered this period.`;
+  listEl.appendChild(allow);
+  intlState.packages.forEach(p => listEl.appendChild(renderCard(p)));
+}
+
+async function load(showSkeletons) {
+  if (showSkeletons) {
+    listEl.innerHTML = '<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+  }
+  const before = cacheSignature();
+  try {
+    // First paint gets a short leash: a dead tunnel / stale button must fail
+    // LOUD and fast, not shimmer for 20s pretending to work.
+    const data = await api('/api/packages', {}, 8000);
+    cache = data.packages || [];
+    appStatus = data.status || null;
+    pollHint = (data.next_check_in != null) ? data.next_check_in : null;
+    tier = {
+      pro: !!data.pro,
+      pkg_limit: data.pkg_limit || 3,
+      retention_days: data.retention_days || 0,
+      facts: data.tier_facts || null,
+    };
+    // A successful load after a self-heal reload: clear the guard so a later
+    // expiry can reload again.
+    try { sessionStorage.removeItem('initDataReload'); } catch (_) {}
+    applyTierUI();
+    render();
+    updateSyncLine();
+    return cacheSignature() !== before;   // did anything the user sees change?
+  } catch (e) {
+    document.getElementById('summary').textContent = '⚠ ' + e.message;
+    listEl.innerHTML = `<div class="state">
+      <div class="big">📡</div><h3 class="error-text">${esc(e.message)}</h3>
+      <p>${e.message.indexOf("Can't reach the server") === 0
+        ? 'Your tunnel may have died or this button is from an old message — the fix for both is a fresh /start.'
+        : 'Make sure the bot and tunnel are running, then try again.'}</p>
+      <button class="btn primary" id="retryBtn">Retry</button></div>`;
+    const rb = document.getElementById('retryBtn');
+    if (rb) rb.onclick = () => load(true);
+    refreshSummary();
+    return false;
+  }
+}
+
+// What the user sees, reduced to a comparable string — the poll cadence keys
+// off this so a quiet dashboard never triggers fast re-polls.
+function cacheSignature() {
+  return JSON.stringify(cache.map(p =>
+    [p.tracking_id, p.status, p.detail, p.last_updated, p.last_checked, p.needs_pro]));
+}
+
+// The footer is the dashboard's health line: sync age, next check, quota
+// pressure and how many packages are paused behind the Pro gate.
+function updateSyncLine() {
+  const el = document.getElementById('syncLine');
+  if (!el) return;
+  const bits = ['Synced just now'];
+  if (appStatus) {
+    if (appStatus.next_check_in != null) {
+      bits.push('next check ' + (fmtIn(appStatus.next_check_in) || 'soon'));
+    }
+    if (appStatus.quota && appStatus.quota.known) {
+      bits.push('17TRACK ' + Math.round(appStatus.quota.percent || 0) + '%');
+    }
+    if (appStatus.ship24_paused) bits.push('backup paused');
+  }
+  const paused = cache.filter(p => p.needs_pro).length;
+  if (paused) bits.push(paused + ' paused (Pro)');
+  el.textContent = bits.join(' · ');
+}
+
+document.getElementById('chips').addEventListener('click', (ev) => {
+  const chip = ev.target.closest('.chip');
+  if (!chip) return;
+  // 🌍 International is Pro-only: free users get the pitch, not a dead end.
+  if (chip.dataset.f === 'international' && !tier.pro) {
+    hap('light');
+    openProSheet();
+    return;
+  }
+  document.querySelectorAll('.chip').forEach(c => {
+    const on = c === chip;
+    c.classList.toggle('active', on);
+    c.setAttribute('aria-pressed', on ? 'true' : 'false');
+  });
+  filter = chip.dataset.f;
+  hap('light');
+  if (filter === 'international' && !intlState.loaded) { loadInternational(); return; }
+  render();
+});
+
+// ── Theme switch — compact iOS slider ─────────
+function applyTierUI() {
+  const segRow = document.getElementById('themeSegRow');
+  if (segRow) segRow.style.display = tier.pro ? '' : 'none';   // themes are Pro-only
+  // Outgoing is Pro-only: the control row and its chip exist only for Pro
+  // (the server refuses free callers regardless).
+  const dirRow = document.getElementById('dirRow');
+  if (dirRow) dirRow.hidden = !tier.pro;
+  const dirChip = document.getElementById('dirChip');
+  if (dirChip) dirChip.hidden = !tier.pro;
+  document.getElementById('proBadge').style.display = tier.pro ? '' : 'none';
+  document.getElementById('upgradeBtn').textContent = tier.pro ? 'Pro' : 'Upgrade to Pro';
+  reflectIntlChip();
+  applyTierFacts();
+  updateTierText();
+}
+// The 🌍 International tab is Pro/owner-only: non-pro never see the chip at
+// all (the server refuses them regardless — hiding it is presentation, not
+// the gate). A viewer who somehow lands on the filter still gets the
+// upgrade view from renderInternational().
+function reflectIntlChip() {
+  const chip = document.querySelector('#chips .chip[data-f="international"]');
+  if (!chip) return;
+  chip.hidden = !tier.pro;
+  if (!tier.pro && filter === 'international') {
+    filter = 'all';
+    render();
+  }
+  refreshChips();
+}
+function updateTierText() {
+  document.getElementById('tierText').textContent =
+    `${cache.length}/${tier.pkg_limit} packages · auto-updating`;
+}
+// The Pro sheet's numbers come from the server (miniapp._tier_facts, built from
+// config + refresh.CADENCE) and the markup's values are only the pre-load
+// fallback. Rendering them here is what keeps the sheet from advertising a
+// schedule the poller doesn't run — it did exactly that for months.
+function fmtCadenceMin(min) {
+  return (min >= 60 && min % 60 === 0) ? (min / 60) + ' h' : min + ' min';
+}
+function applyTierFacts() {
+  const f = tier.facts;
+  if (!f) return;                     // payload not loaded yet: keep the fallback
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('factProPkgs', f.pro_packages);
+  set('factFreePkgs', f.free_packages);
+  set('factProOfd', fmtCadenceMin(f.pro_ofd_min));
+  set('factFreeOfd', fmtCadenceMin(f.free_ofd_min));
+  set('factProTransit', fmtCadenceMin(f.pro_transit_min));
+  set('factFreeTransit', fmtCadenceMin(f.free_transit_min));
+  set('factIntl', f.intl_included);
+  if (typeof f.intl_included === 'number') INTL_TOTAL = f.intl_included;
+}
+// ── Theme: Light / Dark (Halloween) / Pink ───────────
+function themeMetaColor(mode) {
+  return mode === 'light' ? '#f4f6fa' : mode === 'pink' ? '#1d1020' : '#06090f';
+}
+function syncThemeSeg(choice) {
+  document.querySelectorAll('#themeSeg button').forEach((b) => {
+    const active = b.dataset.themeOpt === choice;
+    b.classList.toggle('active', active);
+    b.setAttribute('aria-checked', active ? 'true' : 'false');
+  });
+}
+function applyTheme(choice) {
+  const mode = ['light', 'pink'].includes(choice) ? choice : 'dark';
+  document.body.dataset.theme = mode;
+  try { localStorage.setItem('pkgTheme', mode); } catch (_) {}
+  const meta = document.getElementById('themeColor');
+  if (meta) meta.setAttribute('content', themeMetaColor(mode));
+  syncThemeSeg(mode);
+  return mode;
+}
+// No saved choice: follow the CLIENT's own light/dark setting rather than forcing
+// one. A Mini App that ignores the user's system theme looks broken next to the chat
+// it lives in. Choosing a theme in the app still wins, and is remembered.
+function clientTheme() {
+  try {
+    const p = window.Telegram && Telegram.WebApp && Telegram.WebApp.colorScheme;
+    if (p === 'light' || p === 'dark') return p;
+  } catch (_) {}
+  return 'dark';
+}
+let savedTheme = clientTheme();
+try {
+  const raw = localStorage.getItem('pkgTheme') || '';
+  // Legacy values ('auto' or anything unknown) fall back to the client's setting.
+  savedTheme = ['light', 'dark', 'pink'].includes(raw) ? raw : clientTheme();
+} catch (_) {}
+applyTheme(savedTheme);
+document.querySelectorAll('#themeSeg button').forEach((b) => {
+  b.addEventListener('click', () => { hap('light'); applyTheme(b.dataset.themeOpt); });
+});
+
+// ── Reliable clipboard (iOS webview fallback) ──
+async function copyText(text) {
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch (_) { /* fall through to legacy path */ }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-999px;left:-999px;opacity:0;';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select(); ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand('copy');
+    document.body.removeChild(ta);
+    return ok;
+  } catch (_) { return false; }
+}
+
+// ── Pro upgrade flow ──────────────────────────
+const proSheet = document.getElementById('proSheet');
+let payPoll = null;
+let invoice = null;        // {wallet, usdc_url, usdt_url, payment_id, ...}
+let payToken = 'USDC';     // currently selected payment token
+
+function payUrl() {
+  if (!invoice) return '';
+  return payToken === 'USDT' ? invoice.usdt_url : invoice.usdc_url;
+}
+
+function drawQr() {
+  const qrEl = document.getElementById('qr');
+  if (!qrEl) return;
+  const url = payUrl();
+  qrEl.innerHTML = '';
+  if (!url || !/^solana:[1-9A-HJ-NP-Za-km-z]{32,44}\?/.test(url)) {
+    qrEl.innerHTML = '<div style="color:#111;font-family:-apple-system,system-ui,sans-serif;font-size:12px;font-weight:600;padding:10px;text-align:center">Preparing QR…</div>';
+    return;
+  }
+  // Reliability first: high error correction, generous quiet zone, crisp pixels.
+  const opts = { width: 200, margin: 2, errorCorrectionLevel: 'H',
+    color: { dark: '#111111', light: '#ffffff' } };
+  const fail = () => {
+    qrEl.innerHTML = '<div style="color:#111;font-family:-apple-system,system-ui,sans-serif;font-size:11px;font-weight:600;padding:10px;text-align:center">QR unavailable — copy the address below</div>';
+  };
+  try {
+    if (window.QRCode && typeof QRCode.toCanvas === 'function') {
+      const canvas = document.createElement('canvas');
+      canvas.setAttribute('aria-label', 'Solana Pay QR code for ' + payToken);
+      qrEl.appendChild(canvas);
+      QRCode.toCanvas(canvas, url, opts, (err) => { if (err) fail(); });
+      return;
+    }
+    if (window.QRCode && typeof window.QRCode === 'function') {
+      // qrcodejs (davidshimjs) constructor API.
+      new window.QRCode(qrEl, { text: url, width: 200, height: 200,
+        colorDark: '#111111', colorLight: '#ffffff', correctLevel: 3 });
+      return;
+    }
+  } catch (_) { /* fall through to visible fallback */ }
+  fail();
+}
+
+async function copyWalletAddress() {
+  if (!invoice || !invoice.wallet) {
+    toast('Address is still loading — one moment');
+    return;
+  }
+  hap('light');
+  const ok = await copyText(invoice.wallet);
+  toast(ok ? 'Solana address copied' : 'Press and hold the address to copy it');
+}
+
+async function copyDepositAddress() {
+  const el = document.getElementById('payDepositAddr');
+  const addr = el ? el.textContent.trim() : '';
+  if (!addr || addr === 'loading…') {
+    toast('Address is still loading — one moment');
+    return;
+  }
+  hap('light');
+  const ok = await copyText(addr);
+  toast(ok ? 'Personal address copied' : 'Press and hold the address to copy it');
+}
+
+function setPayToken(tok) {
+  payToken = tok;
+  document.getElementById('tokUsdc').classList.toggle('active', tok === 'USDC');
+  document.getElementById('tokUsdt').classList.toggle('active', tok === 'USDT');
+  drawQr();
+}
+
+// Hand a URL to the OS instead of navigating the webview to it. Inside Telegram
+// that is Telegram.WebApp.openLink() — the sanctioned breakout, and what actually
+// lets the OS route a universal link to the wallet app. A plain
+// window.location.href is swallowed by the webview (and "solana:" is owned by no
+// app on iOS at all), which is why the old wallet buttons went nowhere.
+function openExternal(url) {
+  try {
+    if (window.Telegram && Telegram.WebApp &&
+        typeof Telegram.WebApp.openLink === 'function') {
+      Telegram.WebApp.openLink(url);
+      return;
+    }
+  } catch (_) {}
+  window.open(url, '_blank');
+}
+
+// Which client are we in? Telegram reports it; the user agent is the fallback for an
+// older telegram-web-app.js (the CDN script is versioned, the property is not). This
+// matters for one decision: on iOS the plain Solana Pay link opens nothing at all,
+// so the generic wallet button must not be offered as if it worked.
+function isIOSClient() {
+  try {
+    const p = window.Telegram && Telegram.WebApp && Telegram.WebApp.platform;
+    if (p) return p === 'ios';
+  } catch (_) {}
+  return /iPhone|iPad|iPod/i.test(navigator.userAgent || '');
+}
+
+// One action: open the Solana Pay link. That URI is the spec's own mechanism — the
+// wallet reads the recipient, amount, token, memo and reference out of it — so the payer
+// needs no wallet picker and no knowledge of which app claims the "solana:" scheme.
+async function openWallet() {
+  if (!invoice || !invoice.wallet) {
+    toast('Address is still loading — one moment');
+    return;
+  }
+  const url = payUrl();
+  const st = document.getElementById('payStatus');
+  if (!url) {
+    st.textContent = 'Invoice is still loading — one moment.';
+    return;
+  }
+  hap('medium');
+  const tokenLabel = payToken === 'USDT' ? 'USDT (Solana)' : 'USDC (Solana)';
+  // Stage the address before handing anything over: whatever the OS decides to open,
+  // the payer still has the essentials on screen and on the clipboard.
+  const staged = await copyText(invoice.wallet);
+  let left = false;
+  const onHide = () => { left = true; };
+  document.addEventListener('visibilitychange', onHide, { once: true });
+  openExternal(url);
+  setTimeout(() => {
+    document.removeEventListener('visibilitychange', onHide);
+    if (!left && !document.hidden) {
+      st.textContent = staged
+        ? `No wallet opened — address copied. Scan the QR, or send ${tokenLabel} manually.`
+        : `No wallet opened — scan the QR, or send ${tokenLabel} to the address above.`;
+    }
+  }, 2000);
+}
+
+function startPaymentPolling(paymentId) {
+  if (payPoll) clearInterval(payPoll);
+  const st = document.getElementById('payStatus');
+  if (!st.textContent) st.textContent = '⏳ Waiting for payment…';
+  st.className = 'pay-status-ios';
+  payPoll = setInterval(async () => {
+    try {
+      const status = await api('/api/check_payment?id=' + encodeURIComponent(paymentId));
+      if (status.confirmed) {
+        clearInterval(payPoll);
+        st.textContent = '✅ Payment confirmed — Pro is active';
+        st.className = 'pay-status-ios ok';
+        tier.pro = true;          // enable haptics for the celebration
+        hap('heavy');
+        toast('Pro activated');
+        setTimeout(() => location.reload(), 1600);
+      }
+    } catch (_) { /* keep polling */ }
+  }, 5000);
+}
+
+async function openProSheet() {
+  hap('light');
+  proSheet.classList.add('open');
+  document.body.style.overflow = 'hidden';
+  const card = proSheet.querySelector('.sheet-card');
+  if (card) card.scrollTop = 0;
+  const st = document.getElementById('payStatus');
+  st.textContent = 'Preparing invoice…';
+  st.className = 'pay-status-ios';
+  payToken = 'USDC';
+  const qrEl = document.getElementById('qr');
+  if (qrEl) qrEl.innerHTML = '<div style="color:#111;font-family:-apple-system,system-ui,sans-serif;font-size:12px;font-weight:600;padding:10px;text-align:center">Preparing QR…</div>';
+  // Hidden until this invoice's own address arrives: a stale one from a previous
+  // open would be an address the buyer must not pay.
+  const depReset = document.getElementById('payDepositBlock');
+  if (depReset) {
+    depReset.style.display = 'none';
+    const depResetEl = document.getElementById('payDepositAddr');
+    if (depResetEl) depResetEl.textContent = 'loading…';
+  }
+  // Same rule for the Phantom button: this invoice's own URL or nothing at all. Showing
+  // the PREVIOUS sheet's URL would send the payer to another invoice's payment.
+  const phantomReset = document.getElementById('phantomBtn');
+  if (phantomReset) {
+    phantomReset.style.display = 'none';
+    phantomReset.onclick = null;
+  }
+  // …and the generic button goes back to its default role until this invoice says
+  // otherwise: a previous buyer's iOS hiding must not leak into this sheet.
+  const walletReset = document.getElementById('openWalletBtn');
+  if (walletReset) {
+    walletReset.style.display = '';
+    walletReset.className = 'btn-open-ios';
+    walletReset.textContent = 'Open in my wallet';
+  }
+  try {
+    invoice = await api('/api/create_invoice', { method: 'POST' });
+    document.getElementById('payWallet').textContent = invoice.wallet;
+    // The manual path: an exchange transfer carries no reference and no memo, so
+    // this address is what identifies the payer — and nothing has to be exact.
+    const depBlock = document.getElementById('payDepositBlock');
+    const depEl = document.getElementById('payDepositAddr');
+    if (depBlock && depEl) {
+      const dep = invoice.deposit_address;
+      depBlock.style.display = dep ? '' : 'none';
+      if (dep) {
+        depEl.textContent = dep;
+        depEl.onclick = copyDepositAddress;
+        document.getElementById('copyDepositBtn').onclick = copyDepositAddress;
+      }
+    }
+    // Never re-format this number: the digits after the base price are what
+    // identify this payment (toFixed(2) would drop the tail and lose them).
+    const amtEl = document.getElementById('payAmount');
+    if (amtEl) amtEl.textContent = '$' + (invoice.amount_str || invoice.amount);
+    const noteEl = document.getElementById('payExactNote');
+    if (noteEl) noteEl.textContent = invoice.note ||
+      'One tap opens your wallet with this amount already in it — the link is recognized automatically.';
+    // Base price + duration come from the bot's config, so the sheet can never
+    // advertise a price the server would not invoice.
+    const priceEl = document.getElementById('proPriceBig');
+    if (priceEl && invoice.price_usd) priceEl.textContent = '$' + Number(invoice.price_usd).toFixed(2);
+    const durEl = document.getElementById('proDuration');
+    if (durEl && invoice.subscription_days)
+      durEl.textContent = invoice.subscription_days + ' days · USDC / USDT on the Solana network';
+    setPayToken('USDC');
+    document.getElementById('copyWalletBtn').onclick = copyWalletAddress;
+    document.getElementById('payWallet').onclick = copyWalletAddress;
+    document.getElementById('tokUsdc').onclick = () => { hap('light'); setPayToken('USDC'); };
+    document.getElementById('tokUsdt').onclick = () => { hap('light'); setPayToken('USDT'); };
+    document.getElementById('openWalletBtn').onclick = () => openWallet();
+    // The Phantom choice: a wallet-scoped route (only Phantom answers "phantom://"), for
+    // a payer whose device hands the plain Solana Pay link to some other wallet. The
+    // URL is this invoice's own — the API sends it only when the route is on.
+    const phantomBtn = document.getElementById('phantomBtn');
+    if (phantomBtn && invoice.phantom_url) {
+      phantomBtn.style.display = '';
+      phantomBtn.className = 'btn-open-ios';          // this is the path
+      if (isIOSClient()) {
+        // Not an offer, a dead end: openLink cannot open a custom scheme on iOS.
+        document.getElementById('openWalletBtn').style.display = 'none';
+      } else {
+        const other = document.getElementById('openWalletBtn');
+        other.className = 'btn-copy-ios';
+        other.textContent = 'Other wallets';          // a fallback, not the path
+      }
+      phantomBtn.onclick = () => {
+        hap('medium');
+        st.textContent = 'Opening Phantom…';
+        // Carry the token chosen above: the Phantom page has no picker of its own, and
+        // asking for a token this wallet does not hold is the one refusal it cannot fix.
+        openExternal(invoice.phantom_url + '?token=' + payToken);
+      };
+    }
+    // The quiet second chance: our own page in a browser, with the QR, the address and
+    // the Phantom-app route for a payer whose wallet will not open at all.
+    document.getElementById('payPageLink').onclick = (event) => {
+      event.preventDefault();
+      if (!invoice || !invoice.payment_id) return;
+      openExternal(location.origin + '/pay/' + encodeURIComponent(invoice.payment_id));
+    };
+    startPaymentPolling(invoice.payment_id);
+  } catch (e) {
+    st.textContent = e.message;
+    // The QR box used to keep saying "Preparing QR…" after the failure was
+    // already known (the reported symptom: outside Telegram every call 401s and
+    // the box lied). Say what went wrong where the user is looking.
+    const qrFail = document.getElementById('qr');
+    if (qrFail) {
+      qrFail.innerHTML = '<div style="color:#111;font-family:-apple-system,system-ui,sans-serif;' +
+        'font-size:12px;font-weight:600;padding:10px;text-align:center">' +
+        esc(e.message) + '</div>';
+    }
+  }
+}
+function closeProSheet() {
+  hap('light');
+  proSheet.classList.remove('open');
+  document.body.style.overflow = '';
+  if (payPoll) clearInterval(payPoll);
+}
+document.getElementById('upgradeBtn').onclick = openProSheet;
+document.getElementById('proBack').onclick = closeProSheet;
+proSheet.addEventListener('click', (e) => {
+  if (e.target === proSheet) {
+    closeProSheet();
+  }
+});
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(false); });
+// Telegram webviews have no pull-to-refresh: the footer's sync line doubles
+// as a manual refresh (mouse + keyboard, focusable via tabindex). Bound once
+// at startup, outside every re-rendered code path -- updateSyncLine only ever
+// touches its textContent.
+const sl = document.getElementById('syncLine');
+const doRefresh = () => load(true);
+sl.addEventListener('click', doRefresh);
+sl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); doRefresh(); }
+});
+// Adaptive poll: fast for two ticks after something changed, then idle — and
+// when nothing is due soon, wait out the bot's own schedule (capped at 5 min)
+// instead of polling on a timer nobody is watching. One signed, rate-limited
+// call per tick, far under the server's per-user budget.
+let fastTicks = 0;
+function schedulePoll() {
+  let delay = fastTicks > 0 ? 20000 : 60000;
+  const nxt = (appStatus && appStatus.next_check_in != null)
+    ? appStatus.next_check_in : pollHint;
+  if (!fastTicks && nxt != null && nxt > 70) {
+    delay = Math.min(nxt * 1000 + 1000, 300000);
+  }
+  setTimeout(poll, delay);
+}
+async function poll() {
+  if (!document.hidden) {
+    const changed = await load(false);
+    fastTicks = changed ? 2 : Math.max(0, fastTicks - 1);
+  }
+  schedulePoll();
+}
+schedulePoll();
+
+load(true);
+// Tells the independent watchdog block above that the app parsed and booted;
+// without this line it would report a false "never started" after 5s.
+window.__packeyReady = true;
+
+// ── Add package sheet ─────────────────────────
+const sheet = document.getElementById('addSheet');
+const addTid = document.getElementById('addTid');
+const addName = document.getElementById('addName');
+
+function closeSheet() {
+  sheet.classList.remove('open');
+  addTid.value = '';
+  addName.value = '';
+  // Restore the general-add copy the 🌍 tab's button may have swapped out.
+  addTid.placeholder = 'Tracking number';
+  const hint = document.querySelector('#addSheet .sheet-hint');
+  if (hint) hint.textContent = 'USPS · UPS · FedEx · DHL · OnTrac — auto-detected';
+  setDirection('incoming');       // every add starts as incoming
+}
+
+// ── Incoming / outgoing at add time ────────────
+// Pro only: the row is hidden for free chats (applyTierUI) and the server
+// forces "incoming" for them anyway.
+function setDirection(dir) {
+  ['dirIncoming', 'dirOutgoing'].forEach((id) => {
+    const b = document.getElementById(id);
+    if (b) b.classList.toggle('active', b.dataset.dir === dir);
+  });
+}
+function selectedDirection() {
+  const out = document.getElementById('dirOutgoing');
+  return out && out.classList.contains('active') ? 'outgoing' : 'incoming';
+}
+['dirIncoming', 'dirOutgoing'].forEach((id) => {
+  const b = document.getElementById(id);
+  if (b) b.onclick = () => { hap('light'); setDirection(b.dataset.dir); };
+});
+
+// intlMode swaps the sheet's copy for the 🌍 tab's add button — the same
+// POST /api/add handles both: the server classifies the number's format.
+function openAddSheet(intlMode) {
+  hap('light');
+  sheet.classList.add('open');
+  addTid.placeholder = intlMode
+    ? 'International number — e.g. RR123456789CN'
+    : 'Tracking number';
+  const hint = document.querySelector('#addSheet .sheet-hint');
+  if (hint) hint.textContent = intlMode
+    ? 'China Post · Hongkong Post · other national posts — auto-detected'
+    : 'USPS · UPS · FedEx · DHL · OnTrac — auto-detected';
+  setTimeout(() => addTid.focus(), 320);
+}
+document.getElementById('addBtn').onclick = () => openAddSheet(false);
+document.getElementById('addCancel').onclick = () => { hap('light'); closeSheet(); };
+sheet.addEventListener('click', (e) => { if (e.target === sheet) closeSheet(); });
+
+// ── Share sheet ───────────────────────────────
+// The app's twin of the bot's Share button — but VISIBLY. The first version
+// copied the link to the clipboard behind a 2.4-second toast: the endpoint
+// minted fine (the log showed twelve taps in three seconds), yet the user saw
+// nothing and every extra tap re-minted, killing the link a successful copy
+// had already grabbed. So the link lives on screen, with explicit actions.
+const shareSheet = document.getElementById('shareSheet');
+let shareFor = null;                     // the package the open sheet is about
+
+function fillShare(r) {
+  document.getElementById('shareUrl').textContent = r.url;
+  document.getElementById('shareLife').textContent =
+    (r.expires_in_days > 0
+      ? `Works ${r.expires_in_days} day${r.expires_in_days === 1 ? '' : 's'}`
+      : 'Never expires')
+    + ' · anyone with the link sees the status, never the tracking number.';
+}
+
+async function openShareSheet(p) {
+  shareFor = p;
+  document.getElementById('shareTitle').textContent = `Share "${p.name}"`;
+  document.getElementById('shareUrl').textContent = '…';
+  shareSheet.classList.add('open');
+  hap('light');
+  try {
+    // No refresh flag: re-opening the sheet must show the SAME link, not kill
+    // one already sent (the endpoint is idempotent by default).
+    fillShare(await api('/api/share', {
+      method: 'POST', body: JSON.stringify({ tracking_id: p.tracking_id }),
+    }));
+  } catch (e) {
+    shareSheet.classList.remove('open');
+    toast(e.message);
+  }
+}
+
+document.getElementById('shareCopy').onclick = async () => {
+  hap('light');
+  const ok = await copyText(document.getElementById('shareUrl').textContent);
+  toast(ok ? 'Link copied' : 'Select the link and copy it manually');
+  if (ok) hap('medium');
+};
+const shareNativeBtn = document.getElementById('shareNative');
+if (navigator.share) {
+  // The system share sheet: AirDrop, Messages, WhatsApp — the native path when
+  // the webview offers it. A user dismissal (AbortError) is not an error.
+  shareNativeBtn.onclick = () => {
+    hap('light');
+    navigator.share({
+      title: document.getElementById('shareTitle').textContent,
+      url: document.getElementById('shareUrl').textContent,
+    }).catch(() => {});
+  };
+} else {
+  shareNativeBtn.style.display = 'none';
+}
+document.getElementById('shareNew').onclick = async () => {
+  if (!shareFor) return;
+  hap('light');
+  try {
+    // The EXPLICIT new-link action: mints a fresh token and kills the old one —
+    // the escape hatch for "I think this link leaked".
+    fillShare(await api('/api/share', {
+      method: 'POST',
+      body: JSON.stringify({ tracking_id: shareFor.tracking_id, refresh: true }),
+    }));
+    toast('New link made — the old one is dead');
+    hap('medium');
+  } catch (e) { toast(e.message); }
+};
+document.getElementById('shareRevoke').onclick = () => {
+  if (!shareFor) return;
+  tg.showConfirm('Revoke this share link?', async (ok) => {
+    if (!ok) return;
+    try {
+      await api('/api/share/revoke', {
+        method: 'POST', body: JSON.stringify({ tracking_id: shareFor.tracking_id }),
+      });
+      shareSheet.classList.remove('open');
+      toast('Link revoked — the link stopped working everywhere');
+    } catch (e) { toast(e.message); }
+  });
+};
+document.getElementById('shareBack').onclick = () => { hap('light'); shareSheet.classList.remove('open'); };
+shareSheet.addEventListener('click', (e) => { if (e.target === shareSheet) shareSheet.classList.remove('open'); });
+
+document.getElementById('addSave').onclick = async () => {
+  const tid = addTid.value.trim();
+  const name = addName.value.trim();
+  if (!tid) { toast('Enter a tracking number'); return; }
+  const btn = document.getElementById('addSave');
+  btn.disabled = true; btn.textContent = 'Adding…';
+  document.getElementById('summary').textContent = 'Looking up the carrier…';
+  hap('medium');
+  try {
+    const r = await api('/api/add', {
+      method: 'POST',
+      body: JSON.stringify({ tracking_id: tid, name,
+                             direction: selectedDirection() }),
+    }, 120000);
+    cache.push(r.package);
+    if (filter === 'international' && isIntl(r.package)) {
+      intlState.loaded = false;    // the 🌍 list is stale now — reload it
+      loadInternational();
+    } else render();
+    closeSheet();
+    toast(`“${r.package.name}” added`);
+    hap('medium');
+  } catch (e) {
+    toast(e.message);
+    // Never auto-open Pro here — keep the sheet open so typed input isn't lost.
+    // Upgrade stays voluntary via the 🌟 button in the tier row.
+    refreshSummary();
+  }
+  btn.disabled = false; btn.textContent = 'Add package';
+};
+addTid.addEventListener('keydown', (e) => { if (e.key === 'Enter') addName.focus(); });
+addName.addEventListener('keydown', (e) => { if (e.key === 'Enter') document.getElementById('addSave').onclick(); });
+} catch (e) {
+  // Anything above threw before first render — show it instead of blank.
+  bootFailed((e && e.message) || 'Unexpected error during startup');
+}
+}
+</script>
+<div id="pageEnd"></div>
+</body>
+</html>

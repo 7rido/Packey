@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>glm-tracker — how it works (ASD-STE100)</title>
+<style>
+  body{font-family:system-ui,-apple-system,sans-serif;max-width:1240px;margin:2rem auto;padding:0 1rem;color:#0f172a;background:#f8fafc}
+  h1{font-size:1.6rem}
+  h2{font-size:1.15rem;margin-top:1.8rem;border-bottom:2px solid #e2e8f0;padding-bottom:.2rem}
+  svg#graph{width:100%;height:auto;background:#fff;border:1px solid #e2e8f0;border-radius:10px}
+  .legend span{display:inline-block;margin-right:1rem;font-size:.85rem}
+  .dot{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:middle;margin-right:4px;border:1px solid #94a3b8}
+  li{margin:.35rem 0}
+  code{background:#eef2f7;padding:1px 5px;border-radius:4px;font-size:.9em}
+  .ste-note{margin-top:2rem;font-size:.85rem;color:#475569;border-top:1px dashed #cbd5e1;padding-top:.8rem}
+</style>
+</head>
+<body>
+<h1>glm-tracker — how it works</h1>
+<p>This page follows ASD-STE100 Simplified Technical English. The sentences are short. The voice is active. One sentence tells one thing.</p>
+
+<h2>1 · The system graph</h2>
+<svg id="graph" viewBox="0 0 1180 680" xmlns="http://www.w3.org/2000/svg" font-family="system-ui,sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#64748b"/>
+    </marker>
+  </defs>
+  <style>
+    .box{fill:#eef4fb;stroke:#5b7a99;stroke-width:1.4}
+    .store{fill:#fdf6e3;stroke:#b08d2c}
+    .ext{fill:#f6ecec;stroke:#a45757}
+    .web{fill:#eefaf1;stroke:#3c8b5c}
+    .lbl{font-size:13px;font-weight:600;fill:#0f172a}
+    .sub{font-size:11px;fill:#475569}
+    .edge{stroke:#64748b;stroke-width:1.4;fill:none;marker-end:url(#arr)}
+    .etext{font-size:10.5px;fill:#334155}
+  </style>
+  <!-- Actors -->
+  <rect class="ext" x="20" y="60" width="150" height="70" rx="8"/>
+  <text class="lbl" x="95" y="90" text-anchor="middle">Telegram user</text>
+  <text class="sub" x="95" y="108" text-anchor="middle">sends numbers · gets cards</text>
+
+  <rect class="ext" x="20" y="440" width="150" height="70" rx="8"/>
+  <text class="lbl" x="95" y="470" text-anchor="middle">Mini App user</text>
+  <text class="sub" x="95" y="488" text-anchor="middle">opens the web page</text>
+
+  <!-- Core -->
+  <rect class="box" x="250" y="45" width="200" height="100" rx="8"/>
+  <text class="lbl" x="350" y="75" text-anchor="middle">main.py</text>
+  <text class="sub" x="350" y="93" text-anchor="middle">aiogram 3 handlers</text>
+  <text class="sub" x="350" y="108" text-anchor="middle">command menu · /help</text>
+  <text class="sub" x="350" y="123" text-anchor="middle">startup · re-exports</text>
+
+  <rect class="box" x="530" y="30" width="240" height="130" rx="8"/>
+  <text class="lbl" x="650" y="60" text-anchor="middle">carriers.py</text>
+  <text class="sub" x="650" y="80" text-anchor="middle">carrier detection</text>
+  <text class="sub" x="650" y="95" text-anchor="middle">17TRACK first</text>
+  <text class="sub" x="650" y="110" text-anchor="middle">USPS tiers · OnTrac</text>
+  <text class="sub" x="650" y="125" text-anchor="middle">fetch_track_status dispatch</text>
+
+  <rect class="box" x="530" y="200" width="240" height="110" rx="8"/>
+  <text class="lbl" x="650" y="230" text-anchor="middle">refresh.py</text>
+  <text class="sub" x="650" y="250" text-anchor="middle">background poller</text>
+  <text class="sub" x="650" y="265" text-anchor="middle">adaptive cadence</text>
+  <text class="sub" x="650" y="280" text-anchor="middle">browser sweep · quota watch</text>
+
+  <!-- Paid + USPS tiers -->
+  <rect class="ext" x="870" y="30" width="190" height="80" rx="8"/>
+  <text class="lbl" x="965" y="60" text-anchor="middle">ship24.py</text>
+  <text class="sub" x="965" y="78" text-anchor="middle">paid last resort</text>
+  <text class="sub" x="965" y="93" text-anchor="middle">daily cap · pause logic</text>
+
+  <rect class="ext" x="870" y="150" width="190" height="80" rx="8"/>
+  <text class="lbl" x="965" y="176" text-anchor="middle">usps_api.py</text>
+  <text class="sub" x="965" y="194" text-anchor="middle">USPS OAuth API v3</text>
+  <text class="sub" x="965" y="212" text-anchor="middle">+ usps_browser.py (lazy)</text>
+  <!-- Pro / payments -->
+  <rect class="box" x="250" y="200" width="200" height="120" rx="8"/>
+  <text class="lbl" x="350" y="228" text-anchor="middle">pro.py</text>
+  <text class="sub" x="350" y="246" text-anchor="middle">Pro tiers · receipts</text>
+  <text class="sub" x="350" y="261" text-anchor="middle">Solana payments</text>
+  <text class="sub" x="350" y="276" text-anchor="middle">intl allowance</text>
+
+  <rect class="box" x="20" y="200" width="150" height="80" rx="8"/>
+  <text class="lbl" x="95" y="228" text-anchor="middle">solana_tx.py</text>
+  <text class="sub" x="95" y="246" text-anchor="middle">unsigned tx bytes</text>
+  <text class="sub" x="95" y="261" text-anchor="middle">no SDK · no keys</text>
+
+  <rect class="box" x="20" y="310" width="150" height="80" rx="8"/>
+  <text class="lbl" x="95" y="336" text-anchor="middle">phantom_link.py</text>
+  <text class="sub" x="95" y="354" text-anchor="middle">Phantom deep links</text>
+  <text class="sub" x="95" y="369" text-anchor="middle">+ phantom_page.py</text>
+
+  <!-- Mini App -->
+  <rect class="web" x="250" y="400" width="200" height="110" rx="8"/>
+  <text class="lbl" x="350" y="428" text-anchor="middle">miniapp.py</text>
+  <text class="sub" x="350" y="446" text-anchor="middle">HTTP server + JSON API</text>
+  <text class="sub" x="350" y="461" text-anchor="middle">invoice views</text>
+  <text class="sub" x="350" y="476" text-anchor="middle">initData validation</text>
+
+  <rect class="web" x="530" y="400" width="240" height="110" rx="8"/>
+  <text class="lbl" x="650" y="428" text-anchor="middle">webapp/</text>
+  <text class="sub" x="650" y="446" text-anchor="middle">index.html + vendor/</text>
+  <text class="sub" x="650" y="461" text-anchor="middle">Mini App UI (one file)</text>
+  <text class="sub" x="650" y="476" text-anchor="middle">same card style as bot</text>
+<!--M3-->
+</body>
+</html>

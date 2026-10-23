@@ -1,0 +1,8 @@
+--- a/requirements.txt	2026-09-24 18:51:12.627117614 +0000
++++ b/requirements.txt	2026-10-19 05:03:34.033013955 +0000
+@@ -1,4 +1,4 @@
+-aiogram==3.22.0
++aiogram==3.31.0
+ aiohttp>=3.9,<4
+ httpx>=0.26,<1.0
+ python-dotenv>=1.0

@@ -1,0 +1,2020 @@
+"""USPS/UPS carrier tracking via a real browser — the fallback tier.
+
+Drives carrier tracking pages inside headless Chrome and extracts the rendered
+status. Carriers gate the direct result URLs behind JS challenges (Akamai-style),
+which a plain HTTP client can't pass — this module does, by executing the page's
+JavaScript with a profile that carries real trust cookies.
+
+Honest role: production FALLBACK for USPS numbers before their first acceptance
+scan (17TRACK refuses those; this tier reads the carrier's own page), and for
+UPS pages that the official APIs don't cover yet. It is:
+  * slow (~5-10s per lookup) and heavyweight (spawns a browser),
+  * grey-area automation against a carrier's site — brittle, and it can draw
+    bot-defensive blocks from the carrier. Official APIs are always preferred:
+    USPS v3 is integrated and consulted first; UPS, FedEx and DHL have official
+    tracking APIs and belong on the roadmap ahead of any new browser parser.
+
+Carrier support lives in _CARRIER_PAGES: one warm-up URL, one per-number URL and
+one parser per carrier. USPS is the original; UPS was added after the carrier
+probe proved a headless read (scripts/probe_carrier_browser.py, GO-BROWSER-STATUS
+in ~6 s via /track?tracknum=). DHL/FedEx follow when their parsers are
+trustworthy — the probe measured traps (walled JSON, a dead URL variant).
+Diagnostics go through the "tracker" logger (same file as the bot).
+"""
+
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import time
+from typing import Dict, List, Optional, Tuple
+
+# Load .env here too — this module can be imported standalone (main.py also
+# loads it; load_dotenv is idempotent).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+LOGGER = logging.getLogger("tracker")
+
+
+def _mask(tid: str) -> str:
+    """Mask a tracking number for logs (9400...3527). Mirrors
+    carriers._sanitize_tracking_id — kept local so this module never needs
+    carriers importable (standalone probes, fixture capture)."""
+    if not tid or len(tid) <= 8:
+        return tid
+    if len(tid) <= 11:
+        return f"{tid[:2]}...{tid[-2:]}"
+    return f"{tid[:4]}...{tid[-4:]}"
+
+CHROME_PATH = (os.getenv("USPS_CHROME_PATH")
+               or "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+# VERIFIED by live probes (2026-10): the tier's Chrome never reads the
+# cloned Cookies file — it wants copy/Default/…, and Playwright launches
+# with --use-mock-keychain so real-Chrome-encrypted values can't decrypt
+# anyway. A VIRGIN profile delivered on its first session, so the trust this
+# tier needs comes from its own warm-up visit in a real-Chrome binary with
+# the UA/stealth below — not from copied cookies. The clone stays because
+# its ACCUMULATED warm-up state matters (deleting it per batch measurably
+# hurt the tier), and it is pruned to carrier-only cookies for privacy.
+# The source path is overridable via USPS_CHROME_PROFILE.
+CHROME_PROFILE = ((os.getenv("USPS_CHROME_PROFILE")
+                   or os.path.expanduser("~/Library/Application Support/Google/Chrome/Default")))
+_PROFILE_COPY = os.path.expanduser("~/Library/Caches/usps_tracker_profile")
+_PROFILE_MAX_AGE = 2 * 3600  # Akamai trust cookies rotate fast — refresh copy often
+
+
+def _profile_copy_for(slug: str) -> str:
+    """Per-carrier slot copy path. Chrome takes a SingletonLock per
+    user-data-dir, so every CONCURRENT browser needs its own copy. Slots are
+    keyed by carrier: carriers run in parallel while each carrier's request
+    rate stays at one session — parallelism never multiplies what any single
+    carrier's WAF sees from us. Derives from _PROFILE_COPY, so a debug
+    redirect (dbg_tid) still lands in its own tree."""
+    return f"{_PROFILE_COPY}-{slug}"
+
+# Opt-in fixture capture (USPS_DEBUG_DIR): when set, an EMPTY browser result
+# saves the page text (redacted) so a carrier layout change becomes a
+# reproducible fixture instead of a mystery. Masks tracking-number-shaped
+# digit runs and emails; NAMES AND ADDRESSES ARE NOT MASKED — review a
+# capture before sharing it.
+USPS_DEBUG_DIR = (os.getenv("USPS_DEBUG_DIR") or "").strip() or None
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _save_debug_capture(slug: str, tid: str, text: str) -> None:
+    """Save redacted page text for an empty result (only when USPS_DEBUG_DIR
+    is set). Owner-only file, best-effort: capture must never fail a lookup."""
+    if not USPS_DEBUG_DIR or not text:
+        return
+    try:
+        redacted = _EMAIL_RE.sub("[email]", text)
+        redacted = re.sub(r"\d{9,}", lambda m: _mask(m.group()), redacted)
+        os.makedirs(USPS_DEBUG_DIR, exist_ok=True)
+        name = "%s-%s-%d.txt" % (slug, _mask(tid).replace("...", "-"),
+                                 int(time.time()))
+        fd = os.open(os.path.join(USPS_DEBUG_DIR, name),
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(redacted)
+    except OSError:
+        pass
+
+
+_CREATED_MARKER = ".created_at"
+
+
+def _profile_copy_is_warm(copy_dir: Optional[str] = None) -> bool:
+    """True when a profile copy exists and was BUILT under _PROFILE_MAX_AGE.
+
+    Age comes from the .created_at marker written right after the copy is
+    built — NOT from the directory mtime: shutil.copytree copystats the
+    destination root, stamping the copy with the SOURCE dir's age, so a
+    freshly built copy can look stale and get rebuilt on every batch.
+    Copies without a marker (older builds) still fall back to the mtime.
+
+    The batch path deletes the copy only when this is False: re-copying ~50 MB
+    per batch dropped the warm cookies that make the tier pass the carrier's
+    bot defenses, and made the age-based reuse unreachable."""
+    copy_dir = copy_dir or _PROFILE_COPY
+    try:
+        if not os.path.isdir(copy_dir):
+            return False
+        marker = os.path.join(copy_dir, _CREATED_MARKER)
+        if os.path.isfile(marker):
+            with open(marker) as fh:
+                created = float(fh.read().strip() or 0)
+            if created > 0:
+                return time.time() - created <= _PROFILE_MAX_AGE
+        return time.time() - os.path.getmtime(copy_dir) <= _PROFILE_MAX_AGE
+    except (OSError, ValueError):
+        return False
+
+# Privacy modes:
+#   "slim" (default) - copy ONLY the cookie jar + encryption state (~2 MB).
+#   "full"          - legacy behavior: clone most of the real profile (~1 GB).
+# To revert to the old behavior: USPS_PROFILE_MODE=full (or restore.sh).
+USPS_PROFILE_MODE = (os.getenv("USPS_PROFILE_MODE") or "slim").strip().lower()
+_PROFILE_KEEP = {"Cookies", "Local State"}               # slim: keep only these
+# "Login Data" is the saved-passwords store — a full-mode clone must never
+# carry it into the throwaway copy under ~/Library/Caches.
+_PROFILE_FULL_IGNORE = {"Cache", "Code Cache", "GPUCache", "Cached Data",
+                        "Cached Data_1", "Web Data", "History",
+                        "Download Metadata", "Session Storage", "Preferences",
+                        "Login Data", "Login Data-journal"}
+
+# Akamai serves the tracking widget to real (headful) browser windows but not
+# headless ones. On-demand lookups therefore open a VISIBLE Chrome window when
+# this is enabled — transparent since it only runs on your own commands.
+USPS_BROWSER_HEADFUL = (os.getenv("USPS_BROWSER_HEADFUL") or "").strip().lower() in ("1", "true", "yes")
+
+# Carriers the browser tier must skip entirely (comma-separated slugs, read at
+# import like every other knob here). Both the sweep and the on-demand tier
+# consult browser_slugs(), so one filter covers both paths. Motivated by
+# 2026-10-04: dhl.com's track-and-trace micro-frontend config 404s in every
+# locale, so the DHL widget cannot render for ANY visitor — the tier would
+# burn its full attempt budget per sweep and only ever answer no_data.
+def _parse_disabled_slugs(raw: str) -> frozenset:
+    """Parse USPS_BROWSER_DISABLED_SLUGS: CSV of slugs, case-insensitive,
+    blanks ignored."""
+    return frozenset(
+        s.strip().lower() for s in (raw or "").split(",") if s.strip())
+
+
+_DISABLED_SLUGS = _parse_disabled_slugs(os.getenv("USPS_BROWSER_DISABLED_SLUGS"))
+
+
+def _resolve_headful(headful: Optional[bool]) -> bool:
+    """Per-call headful choice; None = the module default
+    (USPS_BROWSER_HEADFUL). Lets a caller retry one blocked lookup with a
+    visible window without flipping the bot's global mode."""
+    return USPS_BROWSER_HEADFUL if headful is None else headful
+
+# How many USPS numbers ONE browser session may check before starting a new
+# session. Keeps requests per session low so Akamai's bot flag stays quiet.
+try:
+    USPS_BATCH_MAX = max(1, int(os.getenv("USPS_BATCH_MAX", "35")))
+except ValueError:
+    USPS_BATCH_MAX = 35
+
+# UPS only: spy the carrier's own guest API (webapis.ups.com/track/api/
+# Track/GetStatus) instead of reading the rendered page — the FedEx trick.
+# OFF by default: the rendered page already answers, and a miss costs the whole
+# window. Measured on the engine's OWN path (2026-09-24, after an ad-hoc probe
+# under-reported it): the call fired in 6 of 6 windows at 9-12s, so the window is
+# 30s rather than the 115s the first cold-session reading suggested. The
+# rendered-page parse stays the fallback, so enabling this cannot lose an answer.
+def _env_flag(name: str) -> bool:
+    """True when the env var is 1/true/yes. Unset or blank is False."""
+    return (os.getenv(name) or "").strip().lower() in ("1", "true", "yes")
+
+
+UPS_BROWSER_JSON = _env_flag("UPS_BROWSER_JSON")
+
+# .env-configurable: carrier pages fingerprint the agent, and a hard-coded
+# version drifts as real Chrome moves. Blank = the default below.
+_UA_FALLBACK = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36")
+_UA_TEMPLATE = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36")
+_UA_MISMATCH_WARNED: set = set()
+
+
+def _installed_chrome_major(path: str = None) -> Optional[int]:
+    """Major version of the Chrome binary we actually launch, read from the
+    .app bundle's Info.plist (cheap; no process spawn). None if unreadable.
+
+    Why it matters: Chrome sends its REAL version in the sec-ch-ua client
+    hints no matter what user_agent we override. A UA claiming a different
+    major than the hints is a classic bot tell — Akamai withholds sensor
+    trust and FedEx's SPA never fires its shipments API (2026-10-22: .env
+    pinned Chrome/155 while Chrome had auto-updated to 156)."""
+    path = path or CHROME_PATH
+    try:
+        import plistlib
+        marker = ".app/Contents/"
+        if marker not in path:
+            return None
+        plist = path.split(marker)[0] + ".app/Contents/Info.plist"
+        with open(plist, "rb") as fh:
+            ver = plistlib.load(fh).get("CFBundleShortVersionString", "")
+        return int(str(ver).split(".")[0])
+    except Exception:
+        return None
+
+
+def current_ua() -> str:
+    """UA for a NEW browser session, matched to the installed Chrome's major
+    version. Re-read per launch so a Chrome auto-update while the bot runs
+    can't reintroduce drift. USPS_BROWSER_UA is honoured only when it agrees
+    with the installed major (or the version can't be read)."""
+    env_ua = (os.getenv("USPS_BROWSER_UA") or "").strip()
+    major = _installed_chrome_major()
+    if major is None:
+        return env_ua or _UA_FALLBACK
+    if env_ua:
+        m = re.search(r"Chrome/(\d+)", env_ua)
+        if m and int(m.group(1)) == major:
+            return env_ua
+        if major not in _UA_MISMATCH_WARNED:
+            _UA_MISMATCH_WARNED.add(major)
+            LOGGER.warning("browser UA: USPS_BROWSER_UA claims Chrome/%s but "
+                           "installed Chrome is %d — using Chrome/%d instead",
+                           m.group(1) if m else "?", major, major)
+    return _UA_TEMPLATE.format(major=major)
+
+
+# Module-level snapshot kept for scripts/tests that import UA; live sessions
+# call current_ua() at launch instead.
+UA = current_ua()
+
+# When a carrier's edge denies us (Akamai 403 / rate-limit 429 on a page
+# load), pause THAT carrier's browser checks for a while instead of spawning
+# Chrome per package every cycle. 5 minutes: frequent enough to notice a
+# lifted refusal, gentle enough to not rage the WAF. Keyed per carrier — a
+# FedEx refusal must never freeze USPS sweeps.
+USPS_BROWSER_BACKOFF = 300  # seconds (5 min)
+# Consecutive refusals escalate: pause = BACKOFF * 2**(strikes-1), capped at
+# 8x, plus up to 25% jitter so a crash loop can't sync its retries. A success
+# resets the count. The state persists across restarts: without that, every
+# restart would start a fresh 5-min pause and re-hammer a carrier that just
+# refused us — the classic crash-loop-to-WAF-ban path.
+_THROTTLE_BACKOFF_MAX = 8
+_THROTTLE_JITTER = 1.25
+_throttled_until: Dict[str, float] = {}
+_throttle_strikes: Dict[str, int] = {}
+_THROTTLE_STORE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "browser_throttle.json")
+
+
+def _load_throttle_state() -> None:
+    """Restore refused-carrier pauses across restarts. Corrupt or expired
+    entries are ignored — a broken store must never wedge the tier."""
+    try:
+        with open(_THROTTLE_STORE) as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return  # missing or corrupt store: start clean
+    if not isinstance(raw, dict):
+        return
+    now = time.time()
+    for slug, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        try:
+            until = float(entry.get("until") or 0)
+            strikes = int(entry.get("strikes") or 0)
+        except (TypeError, ValueError):
+            continue
+        if until > now and strikes > 0:
+            _throttled_until[slug] = until
+            _throttle_strikes[slug] = strikes
+
+
+def _save_throttle_state() -> None:
+    """Atomic write (tmp + os.replace), owner-only, best-effort: state
+    persistence must never fail a lookup."""
+    try:
+        now = time.time()
+        payload = {slug: {"until": until,
+                          "strikes": _throttle_strikes.get(slug, 0)}
+                   for slug, until in _throttled_until.items() if until > now}
+        tmp = _THROTTLE_STORE + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, _THROTTLE_STORE)
+    except OSError:
+        pass
+
+
+def is_throttled(slug: str = "usps") -> bool:
+    """True while the slug's edge has flagged us: a session launched now
+    would bounce. (No-arg callers mean USPS — the historical behavior.)"""
+    return time.time() < _throttled_until.get(slug, 0.0)
+
+
+def _note_edge_refusal(slug: str, status, warmup: bool = False) -> None:
+    """Record a hard edge refusal from a page load: 403/429 always, and a
+    warmup-page 404 (that page exists unconditionally, so a 404 there is the
+    edge lying — exactly as hard as a 403). A 404 on a per-number URL stays
+    soft (ambiguous — left to the first-item abort). Soft signals otherwise
+    (a missed API window, an empty parse) are never throttled — the FedEx SPA
+    misses its own call on most boots by design, and the attempt loop already
+    re-navigates. Consecutive refusals double the pause (capped at 8x, with
+    jitter); the pause and the strike count persist across restarts."""
+    if status in (403, 429) or (warmup and status == 404):
+        _arm_throttle(slug, "edge refused the page load (%s)" % status)
+
+
+def _arm_throttle(slug: str, why: str) -> None:
+    """Arm (and escalate) this carrier's pause: consecutive refusals double
+    the base backoff, capped at 8x with jitter, persisted across restarts."""
+    strikes = _throttle_strikes.get(slug, 0) + 1
+    _throttle_strikes[slug] = strikes
+    factor = min(_THROTTLE_BACKOFF_MAX, 2 ** (strikes - 1))
+    pause = USPS_BROWSER_BACKOFF * factor * random.uniform(1.0, _THROTTLE_JITTER)
+    _throttled_until[slug] = time.time() + pause
+    _save_throttle_state()
+    LOGGER.warning("%s browser: %s — pausing this carrier for %ds (strike %d, pause x%d)",
+                   _CARRIER_PAGES.get(slug, {}).get("label", slug),
+                   why, int(pause), strikes, factor)
+
+
+def _note_block_page(slug: str) -> None:
+    """The edge answered HTTP 200 but the page is a block/challenge page (see
+    _looks_blocked): refuse the carrier exactly like a hard 403 — one request
+    per flagged session instead of three retries that only hand the bot
+    defense more signals."""
+    _arm_throttle(slug, "the edge answered a block page")
+
+
+def _note_edge_success(slug: str) -> None:
+    """A real success clears the consecutive-refusal escalation (and any
+    active pause): the carrier answered, so the next refusal starts over
+    at the base backoff."""
+    if _throttle_strikes.pop(slug, None) is not None:
+        _throttled_until.pop(slug, None)
+        _save_throttle_state()
+
+
+# Per-number failure reasons (bounded): why the most recent browser attempt
+# for a tracking id produced what it did. A read-only aid for operators;
+# nothing in the lookup chain branches on these.
+_LAST_OUTCOME: Dict[str, str] = {}
+_OUTCOME_MAX = 4096
+
+
+def _note_outcome(tid: str, reason: str) -> None:
+    if not tid:
+        return
+    if len(_LAST_OUTCOME) >= _OUTCOME_MAX and tid not in _LAST_OUTCOME:
+        _LAST_OUTCOME.clear()  # bounded: drop history rather than grow forever
+    _LAST_OUTCOME[tid] = reason
+
+
+def get_last_outcome(tid: str) -> Optional[str]:
+    """Why the most recent browser attempt for this number produced what it
+    did: ok, no_data, parse_failed, throttled, timeout, aborted, busy,
+    no_profile, no_playwright or error. None = never attempted."""
+    return _LAST_OUTCOME.get(tid)
+
+
+_load_throttle_state()
+
+
+# Render-based arming ("did the page look like a result?") was considered
+# and rejected: with warmup-404 covered, every realistic flagged session
+# (403/429/404 at warmup or first goto) already arms, and the first-item
+# abort bounds the per-cycle waste for anything softer.
+_STEALTH = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+// Never let the browser brand itself as headless in navigator.userAgent.
+try {
+  const uaDesc = Object.getOwnPropertyDescriptor(Navigator.prototype, 'userAgent');
+  if (uaDesc && uaDesc.get) {
+    const orig = uaDesc.get;
+    Object.defineProperty(Navigator.prototype, 'userAgent', {
+      get: () => orig.call(navigator).replace(/HeadlessChrome/gi, 'Chrome'),
+    });
+  }
+} catch (_) {}
+
+// ── Look like a REGULAR, non-incognito Chrome window ─────────────────────
+// Real desktop metrics of this machine (Retina MacBook Pro, CSS px @2x):
+// sessions carry cookies earned in a real window of exactly this geometry.
+try {
+  Object.defineProperty(screen, 'width', {get: () => 1512});
+  Object.defineProperty(screen, 'height', {get: () => 982});
+  Object.defineProperty(screen, 'availWidth', {get: () => 1512});
+  Object.defineProperty(screen, 'availHeight', {get: () => 957});
+  Object.defineProperty(screen, 'availLeft', {get: () => 0});
+  Object.defineProperty(screen, 'availTop', {get: () => 25});
+  Object.defineProperty(screen, 'colorDepth', {get: () => 30});
+  Object.defineProperty(screen, 'pixelDepth', {get: () => 30});
+} catch (_) {}
+try {
+  // Headless reports outer == inner; real windows have UI chrome (≈87px).
+  Object.defineProperty(window, 'outerWidth', {get: () => window.innerWidth});
+  Object.defineProperty(window, 'outerHeight', {get: () => window.innerHeight + 87});
+  Object.defineProperty(window, 'screenX', {get: () => 60});
+  Object.defineProperty(window, 'screenY', {get: () => 40});
+} catch (_) {}
+try {  // hardware: M1 Pro (10 cores), Chrome caps deviceMemory at 8
+  Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 10});
+  Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+} catch (_) {}
+
+// window.chrome: real Chrome exposes csi/loadTimes/app — headless builds
+// don't. Never clobber an existing object; only fill the gaps.
+try {
+  window.chrome = window.chrome || {};
+  if (!window.chrome.runtime) window.chrome.runtime = {};
+  if (!window.chrome.csi) window.chrome.csi = function () {
+    return {startE: Date.now(), onloadT: Date.now(), pageT: 1200, tran: 15};
+  };
+  if (!window.chrome.loadTimes) window.chrome.loadTimes = function () {
+    const t = Date.now() / 1000;
+    return {requestTime: t, startLoadTime: t, commitLoadTime: t,
+            finishDocumentLoadTime: t, finishLoadTime: t,
+            firstPaintTime: t, firstPaintAfterLoadTime: 0,
+            navigationType: 'Other', wasFetchedViaSpdy: true,
+            wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2',
+            wasAlternateProtocolAvailable: false, connectionInfo: 'h2'};
+  };
+  if (!window.chrome.app) window.chrome.app = {
+    isInstalled: false,
+    InstallState: {DISABLED: 'disabled', INSTALLED: 'installed',
+                   NOT_INSTALLED: 'not_installed'},
+    RunningState: {CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run',
+                   RUNNING: 'running'},
+    getDetails: function () {}, getIsInstalled: function () {},
+    running: function () { return false; },
+  };
+} catch (_) {}
+
+// Incognito tell #1: tiny storage quota. Report a normal ~250 GB pool.
+try {
+  navigator.storage.estimate = function () {
+    return Promise.resolve({usage: 24117248, quota: 268435456000});
+  };
+} catch (_) {}
+// Incognito tell #2: notifications are force-denied in private windows.
+try {
+  if (window.Notification && Notification.permission === 'denied') {
+    Object.defineProperty(Notification, 'permission', {get: () => 'default'});
+  }
+} catch (_) {}
+try {
+  const origQuery = window.navigator.permissions &&
+                    window.navigator.permissions.query;
+  if (origQuery) {
+    window.navigator.permissions.query = function (p) {
+      if (p && p.name === 'notifications') {
+        return Promise.resolve({state: Notification.permission,
+                                onchange: null});
+      }
+      return origQuery.call(window.navigator.permissions, p);
+    };
+  }
+} catch (_) {}
+// Headless often reports the document as unfocused/hidden.
+try {
+  document.hasFocus = function () { return true; };
+  Object.defineProperty(document, 'visibilityState', {get: () => 'visible'});
+  Object.defineProperty(document, 'hidden', {get: () => false});
+} catch (_) {}
+"""
+
+
+# Page-shell/nav text that must never end up in a "Latest update" line. This
+# is a defensive BACKSTOP: _result_zone failing closed (below) is the primary
+# defense — a page that never rendered a real result should never reach here
+# with this text in it — but a widget-layout change could still let a
+# fragment through, so we also scrub it at the detail-cleaning stage.
+_NAV_CHROME = ("skip to main content", "current language english", "inform all")
+
+
+def _clean_detail(text: str) -> str:
+    """Collapse whitespace and strip USPS widget UI/promo/nav noise so details
+    read like a sentence instead of a page paste."""
+    if not text:
+        return ""
+    txt = " ".join(text.split())
+    stripped_nav = True
+    while stripped_nav:
+        stripped_nav = False
+        low = txt.lower()
+        for marker in _NAV_CHROME:
+            if low.startswith(marker):
+                txt = txt[len(marker):].strip(" ,;:-\u2014")
+                stripped_nav = True
+                break
+    for marker in ("Get More Out of USPS Tracking", "USPS Tracking Plus",
+                   "See Less", "Track Another Package"):
+        i = txt.find(marker)
+        if i != -1:
+            txt = txt[:i]
+    return txt.strip(" ,;:-\u2014")
+
+
+def _result_zone(text: str) -> str:
+    """The live result starts at 'Latest Update'. Some layouts (e.g. Out for
+    Delivery) skip that marker, so fall back to anchoring on the status
+    heading itself. We cut at the 'What Do USPS Tracking Statuses Mean?'
+    explainer, which repeats status words and would break classification.
+
+    FAILS CLOSED: if neither marker is found, the page never rendered a real
+    result (e.g. only nav chrome like "Skip to Main Content" loaded so far).
+    Returning the whole page from position 0 used to let that nav text get
+    classified as a status ("Skip to main content" -> fabricated "Delivery
+    Attempted") — returning "" here instead lets the caller retry the page
+    load rather than trust unrendered chrome."""
+    cut = text.find("What Do USPS Tracking Statuses Mean?")
+    if cut != -1:
+        text = text[:cut]
+    low = text.lower()
+
+    start = text.find("Latest Update")
+    if start >= 0:
+        start += len("Latest Update")
+        return text[start:].strip()
+
+    anchors = ("out for delivery", "in transit", "delivered",
+               "usps awaiting item", "shipping label created",
+               "available for pickup", "notice left", "on the way",
+               "pre-shipment", "pre shipment", "not yet scanned",
+               "not yet been scanned", "awaiting item")
+    hits = [low.find(a) for a in anchors if low.find(a) != -1]
+    if not hits:
+        return ""  # no recognizable status content — fail closed, don't guess
+    return text[min(hits):].strip()
+
+
+def _usps_preshipment_rail(zone: str) -> bool:
+    """The measured pre-shipment page (2026-09-28, the operator's own label):
+    USPS renders the progress rail — Delivered / Out for Delivery / Preparing for
+    Delivery / On the Way / Accepted — with NO Latest Update block. Five milestone
+    chips, none of them an event: first-match over that rail read a label-created
+    parcel as "Out for Delivery"."""
+    low = zone.lower()
+    return all(w in low for w in (
+        "delivered", "out for delivery", "preparing for delivery",
+        "on the way", "accepted"))
+
+
+def _usps_rail_event(zone: str) -> Optional[Tuple[str, str]]:
+    """The one real event on a no-Latest-Update USPS page, as (status, detail).
+
+    Measured 2026-09-28 (the operator's own label): USPS renders the progress
+    rail — Delivered / Out for Delivery / Preparing for Delivery / On the Way /
+    Accepted — and, beneath it, real events newest-first:
+      USPS in possession of item  OZONE PARK, NY 11417   September 28, 11:59 AM
+      Shipping Label Created      NEW YORK, NY 10002     September 26, 6:00 PM
+    The catch that makes this subtle: "USPS in possession of item" is ALSO the
+    Accepted chip's static description, so the acceptance is real only when that
+    stretch carries a date. A chip renders bare; an event carries location + date.
+    Returns (status, detail) or None — None means fail closed and retry.
+    """
+    low = zone.lower()
+    if not _usps_preshipment_rail(zone):
+        return None
+    date_re = (r"\b(january|february|march|april|may|june|july|august|september|"
+               r"october|november|december)\b")
+    if "in possession of item" in low:
+        stretch = low.split("in possession of item", 1)[1].split(
+            "shipping label created", 1)[0]
+        if re.search(date_re, stretch):
+            start = low.find("in possession of item")
+            detail = " ".join(zone[start:].split())
+            end = detail.lower().find("shipping label created")
+            if end > 0:
+                detail = detail[:end].rstrip(" ,;")
+            return "In Transit", detail
+    if "shipping label created" in low:
+        start = low.find("shipping label created")
+        return "Info Received", " ".join(zone[start:].split())
+    return None
+
+
+def _classify(zone: str, no_latest_update: bool = False,
+              allow_terminal: bool = True) -> Optional[str]:
+    # Chips and promo words ("Delivered / Out for Delivery / Preparing for
+    # Delivery") are widget furniture, not events: sitting in the middle of the
+    # zone they used to beat the package's real latest update. So classify the
+    # newest-event text first, and let the whole zone be the fallback (a real
+    # status row can follow the promo block).
+    head = _clean_detail(zone)
+    if head and head != zone:
+        found = _classify(head, no_latest_update=no_latest_update)
+        if found:
+            return found
+    # The pre-shipment rail: USPS's milestone chips are furniture, not events —
+    # read the page's one real event instead of first-matching across the rail.
+    if no_latest_update:
+        rail_event = _usps_rail_event(zone)
+        if rail_event:
+            return rail_event[0]
+        if _usps_preshipment_rail(zone):
+            return None
+    t = zone.lower()
+    # USPS delivery-PREDICTION phrasing (measured 2026-09-29 on the operator's
+    # own in-transit parcel): the page LEADS with "Delivered by the expected
+    # delivery date. As of <date/time>, it is currently in transit to the next
+    # — Expected: <future date>". The word Delivered there belongs to the
+    # prediction banner, not an event: a real delivery page carries a location
+    # and a PAST timestamp, never "expected delivery date" + "currently in
+    # transit". 2026-09-29: this banner read as a terminal Delivered, which
+    # the downgrade guard + terminal cadence then froze forever.
+    if ("delivered by the expected delivery date" in t
+            or ("delivered" in t and "currently in transit" in t)):
+        return "In Transit"
+    checks = (
+        (("out for delivery",), "Out for Delivery"),
+        (("delivered",), "Delivered"),
+        (("available for pickup",), "Available for Pickup"),
+        (("notice left", "delivery attempted", "no authorized recipient", "redelivery"), "Delivery Attempted"),
+        (("returned", "undeliverable as addressed", "security alert", "exception"), "Exception"),
+        # Movement checks come first so an accepted/arrived/in-transit parcel
+        # never gets read as pre-scan just because "scanned" also appears
+        # (e.g. "processed through a facility" mentioning a prior scan).
+        (("in transit", "departed", "arrived at", "arriving", "accepted at",
+          "processed through", "on the way"), "In Transit"),
+        (("shipping label created", "label created", "awaiting item",
+          "pre-shipment", "pre shipment", "not yet scanned",
+          "not yet been scanned", "not yet in the usps network",
+          "hasn't been received"), "Info Received"),
+    )
+    if not allow_terminal:
+        # The zone-wide fallback never claims terminal: the milestone rail
+        # renders FUTURE chips ("Delivered" while the real event is "Departed
+        # Post Office"), and 2026-09-29 one such match produced a false
+        # Delivered that the downgrade guard + terminal cadence froze forever.
+        # Non-terminal statuses keep the loose fallback (they self-correct on
+        # the next poll); a terminal claim reaching this branch is not
+        # isolable from furniture — refusing it just retries (None is the
+        # retry signal). Callers only reach this branch after the
+        # newest-event text already failed to classify.
+        checks = tuple(c for c in checks if c[1] != "Delivered")
+    for needles, status in checks:
+        if any(n in t for n in needles):
+            return status
+    return None
+
+
+def _profile_ignore(_dir: str, names) -> set:
+    if USPS_PROFILE_MODE != "full":
+        # Slim mode: copy only the cookie jar + encryption state (privacy).
+        return {n for n in names if n not in _PROFILE_KEEP or n.startswith(".")}
+    return {n for n in names if n in _PROFILE_FULL_IGNORE or n.startswith(".")}
+
+
+# The only hosts whose PRE-EXISTING cookies the tier can need: the four
+# carrier first-party domains (+ DHL's .de property) and Akamai's bot-defense
+# hosts. Everything else in the jar is a stranger's session (email, banking,
+# ...) that would otherwise sit on disk inside the warm copy for up to
+# _PROFILE_MAX_AGE — so those rows are DELETEd, with secure_delete + VACUUM
+# so the removed values are not left behind in the file's free pages.
+_COOKIE_HOST_ALLOW = ("usps.com", "ups.com", "fedex.com", "dhl.com", "dhl.de",
+                      "akamaihd.net", "akstat.io", "akamaized.net")
+
+
+def _prune_profile_cookies(copy_dir: str) -> None:
+    """Strip non-carrier cookie rows from the copied jar (privacy: the slim
+    copy is otherwise the user's WHOLE Chrome cookie jar). Raises on a
+    malformed jar so the caller can drop the copy rather than browse with it."""
+    import glob as _glob
+    import sqlite3
+    where = " AND ".join(
+        f"NOT (host_key LIKE '%.{d}' OR host_key = '{d}')"
+        for d in _COOKIE_HOST_ALLOW)
+    paths = set(_glob.glob(os.path.join(copy_dir, "Cookies")))
+    paths.update(_glob.glob(os.path.join(copy_dir, "*", "Cookies")))
+    for db in sorted(paths):
+        if not os.path.isfile(db):
+            continue
+        con = sqlite3.connect(db)
+        try:
+            tables = {row[0] for row in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
+            if "cookies" not in tables:
+                continue  # not a cookie jar — nothing recognizable to strip
+            con.execute("PRAGMA secure_delete = ON")
+            cur = con.execute(f"DELETE FROM cookies WHERE {where}")
+            removed = max(0, cur.rowcount)
+            con.commit()
+            con.execute("VACUUM")
+        finally:
+            con.close()
+        os.chmod(db, 0o600)
+        if removed:
+            LOGGER.info("USPS browser: pruned %d non-carrier cookie row(s) "
+                        "from the profile copy", removed)
+
+
+def _prune_session_cookies(slug: str) -> None:
+    """Session-end prune: _ensure_profile_copy prunes when a copy is built or
+    reused, but cookies that ACCUMULATE during the session (the carrier pages
+    pull trackers in) survived until the copy happened to be rebuilt — the UPS
+    slot measured ~81 such rows. Chrome is closed by now and the profile lock
+    is held, so the jar is quiescent. Warn-only on failure, unlike the
+    ensure-time prune: the next session's ensure prune still strips the jar
+    BEFORE any browser opens it, so dropping the copy here would discard warm
+    state for zero privacy gain."""
+    copy_dir = _profile_copy_for(slug)
+    if not os.path.isdir(copy_dir):
+        return
+    try:
+        _prune_profile_cookies(copy_dir)
+    except Exception as e:
+        LOGGER.warning("%s browser: session-end cookie prune failed (%s) — "
+                       "the next session start will retry",
+                       _CARRIER_PAGES.get(slug, {}).get("label", slug),
+                       type(e).__name__)
+
+
+def cleanup_profile_copy():
+    """Remove the local profile copies (privacy: don't leave a browser-identity
+    snapshot on disk). Called on graceful shutdown; harmless to call anytime.
+    Every carrier slot has its own copy — remove them all."""
+    for path in [_PROFILE_COPY] + [_profile_copy_for(slug)
+                                   for slug in _CARRIER_PAGES]:
+        if os.path.isdir(path):
+            try:
+                shutil.rmtree(path, ignore_errors=True)
+                LOGGER.info("USPS browser: removed local profile copy")
+            except OSError as e:
+                LOGGER.warning("USPS browser: could not remove profile copy: %s",
+                               type(e).__name__)
+
+
+def _profile_lock_path(copy_dir: Optional[str] = None) -> str:
+    """Lock file sits NEXT TO the copy dir, never inside it: an rmtree of the
+    copy must not be able to orphan the lock mid-session. One lock per slot."""
+    copy_dir = copy_dir or _PROFILE_COPY
+    parent = os.path.dirname(copy_dir) or os.curdir
+    return os.path.join(parent, "." + os.path.basename(copy_dir) + ".lock")
+
+
+def _acquire_profile_lock(copy_dir: Optional[str] = None,
+                          timeout_s: float = 120.0):
+    """Best-effort cross-process lock on a profile copy. The in-process
+    semaphore already serializes; this covers two PROCESSES — a debug probe
+    racing the bot's session over the same Chrome profile. Returns
+    (handle, busy): (fh, False) = held; (None, True) = another session holds
+    it (give up this batch); (None, False) = the lock file itself is unusable
+    — run unlocked rather than broken. The wait is bounded so a stuck holder
+    costs one batch, never the tier."""
+    try:
+        fh = open(_profile_lock_path(copy_dir), "a+")
+    except OSError:
+        return None, False
+    import fcntl
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fh, False
+        except OSError:
+            if time.monotonic() >= deadline:
+                fh.close()
+                return None, True
+            time.sleep(0.5)
+
+
+def _release_profile_lock(fh) -> None:
+    if fh is None:
+        return
+    try:
+        import fcntl
+        fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _ensure_profile_copy(copy_dir: Optional[str] = None) -> Optional[str]:
+    """Copy the (slimmed) Chrome profile that holds USPS-trusted cookies to a
+    private dir — one per carrier slot (Chrome locks a user-data-dir, so
+    concurrent browsers cannot share one). Returns the copy path, or None if
+    unavailable."""
+    copy_dir = copy_dir or _PROFILE_COPY
+    if not os.path.isdir(CHROME_PROFILE) or not os.path.isfile(
+            os.path.join(CHROME_PROFILE, "Cookies")):
+        return None
+    try:
+        if os.path.isdir(copy_dir):
+            refresh = False
+            try:
+                if time.time() - os.path.getmtime(copy_dir) > _PROFILE_MAX_AGE:
+                    refresh = True
+            except OSError:
+                refresh = True
+            # A leftover legacy "full" copy is way bigger than slim — rebuild it.
+            if not refresh and USPS_PROFILE_MODE != "full":
+                try:
+                    size = sum(os.path.getsize(os.path.join(r_, f))
+                               for r_, _d, fs in os.walk(copy_dir) for f in fs)
+                    refresh = size > 50 * 1024 * 1024
+                except OSError:
+                    refresh = True
+            if refresh:
+                shutil.rmtree(copy_dir, ignore_errors=True)
+        if not os.path.isdir(copy_dir):
+            shutil.copytree(CHROME_PROFILE, copy_dir, ignore=_profile_ignore)
+            os.chmod(copy_dir, 0o700)
+            try:
+                marker = os.path.join(copy_dir, _CREATED_MARKER)
+                with open(marker, "w") as fh:
+                    fh.write(str(time.time()))
+                os.chmod(marker, 0o600)
+            except OSError:
+                pass  # warm check then falls back to the dir mtime
+        # The copied jar is the user's WHOLE Chrome cookie jar — strip every
+        # row the tier cannot need before any browser touches it. This also
+        # runs on warm reuse, so a copy made by an older build gets pruned
+        # too. NOTE: the copy is deliberately NOT deleted per batch — that
+        # was tried and it dropped the accumulated warm-up state the tier
+        # depends on (see the comment at CHROME_PROFILE); the prune is what
+        # shrinks what sits at rest, and cleanup_profile_copy() removes it
+        # on graceful shutdown.
+        try:
+            _prune_profile_cookies(copy_dir)
+        except Exception as e:
+            LOGGER.warning("USPS browser: cookie prune failed (%s) — dropping "
+                           "the profile copy rather than browsing with it",
+                           type(e).__name__)
+            shutil.rmtree(copy_dir, ignore_errors=True)
+            raise
+        for root_1, _dirs_1, files_1 in os.walk(copy_dir):
+            for fname in files_1:
+                os.chmod(os.path.join(root_1, fname), 0o600)
+        return copy_dir
+    except Exception as e:
+        LOGGER.warning("USPS browser: could not copy Chrome profile: %s",
+                       type(e).__name__)
+        return None
+
+
+_EXPECTED_WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                      "saturday", "sunday", "today", "tomorrow")
+
+
+def _expected_delivery(body: str) -> str:
+    """The 'Expected Delivery by MONDAY 21 September 2026 by 9:00pm' block lives
+    in the page's product header — OUTSIDE the fail-closed result zone (measured
+    on a live pre-scan label, 2026-09-17: block at body offset 3646, zone = 181
+    chars). So it must be read from the full body, strictly: only from the
+    newline-delimited block right after the marker, and only when that block
+    carries a time-of-day or a month name. Anything else means '' — never a
+    guess dressed up as a delivery date."""
+    if not body:
+        return ""
+    i = body.lower().find("expected delivery")
+    if i == -1:
+        return ""
+    block = " ".join(body[i + len("expected delivery"):].split("\n\n")[0].split())
+    block = block.strip(" ,;:")
+    # The DOM can render the header as "Expected Delivery by:" (colon span,
+    # per the page HTML) — strip a leading "by" with or without the colon.
+    block = re.sub(r"^by\b\s*:?\s*", "", block, count=1, flags=re.IGNORECASE)
+    # Tooltip prose lives inside the same DOM block; never let it ride along.
+    block = re.split(r"expected delivery on the date provided",
+                     block, maxsplit=1, flags=re.IGNORECASE)[0].strip(" ,;:")
+    # The pre-shipment page (measured 2026-09-28) renders the progress rail right
+    # after the ETA value with no blank line, so the block swallowed it:
+    # "Pending Delivered Out for Delivery Preparing for Delivery …". Stop at the
+    # first rail chip — the ETA value itself never contains one. For a Pending
+    # label that leaves no time/month, so the check below returns '' honestly.
+    stop = len(block)
+    for chip in ("delivered", "out for delivery", "preparing for delivery",
+                 "on the way", "accepted", "in transit", "label created"):
+        j = block.lower().find(chip)
+        if j != -1:
+            stop = min(stop, j)
+    block = block[:stop].strip(" ,;:")
+    if not re.search(r"\d{1,2}:\d{2}\s*[ap]\.?m\.?|"
+                     r"\b(january|february|march|april|may|june|july|august|"
+                     r"september|october|november|december)\b", block.lower()):
+        return ""
+    first = block.split(" ", 1)
+    if first and first[0].lower() in _EXPECTED_WEEKDAYS:
+        block = first[0].capitalize() + (" " + first[1] if len(first) > 1 else "")
+    return " — Expected: " + block
+
+
+def _result_from_body(body: str) -> Optional[Tuple[str, str]]:
+    """Parse rendered widget text into (status, detail), or None.
+
+    "Tracking Number:" alone means the page SHELL loaded, not that the result
+    rendered — _result_zone fails closed (returns "") in that case, and this
+    function must not fabricate a status from an empty/unclassifiable zone.
+    Callers rely on None here to know a retry (fresh page load) is needed."""
+    if not body or not any(w in body for w in ("Latest Update", "Tracking Number:")):
+        return None
+    zone = _result_zone(body)
+    if not zone:
+        return None
+    no_latest = "Latest Update" not in body
+    rail_event = _usps_rail_event(zone) if no_latest else None
+    if rail_event:
+        status, detail = rail_event
+    else:
+        # allow_terminal=False: the zone here may still contain the milestone
+        # rail's FUTURE chips ("Delivered" on an in-transit page) — a terminal
+        # claim may only come from the newest-event text (the head recursion
+        # above keeps it) or the rail's real event.
+        status = _classify(zone, no_latest_update=no_latest, allow_terminal=False)
+        if not status:
+            return None
+        detail = _clean_detail(zone)
+    expected = _expected_delivery(body)[:60]
+    if expected:
+        # The ETA is page furniture worth keeping even when the event text is
+        # long — trade detail tail for it rather than lose either.
+        detail = detail[:180 - len(expected)].rsplit(chr(32), 1)[0].rstrip(" ,;:-—")
+    # total 180 = the storage._apply_lookup trim: the ETA must survive it
+    return status, (detail + expected)[:180]
+
+
+def _parse_ups_body(body: str, tid: str) -> Optional[Tuple[str, str]]:
+    """Parse a rendered UPS /track?tracknum= page into (status, detail), or None.
+
+    Measured page shape (live fixture, 2026-09-18): the widget renders
+    "Tracking Details" → nav lines → "Tracking No. or Delivery Notice" → the
+    CURRENT status word + an icon ("Delivered check_circle") → the number →
+    copy UI noise → the latest event (date, time, "Delivered To", place) →
+    "View Package Location" → shipment details.
+
+    Two rules keep this honest:
+    * the status comes from the line right after the marker — the page's
+      progress rail lists every milestone ("Delivered", "Shipped", ...) as
+      chips, so scanning the whole page for words would read an in-transit
+      parcel as Delivered (measured: both words present on a delivered one);
+    * anything that does not parse fails CLOSED (None) — a "Page Not Found"
+      shell or a half-rendered widget must reach the caller as a retry signal,
+      never as a guessed status.
+    """
+    if not body or "Tracking Details" not in body:
+        return None
+    # The number must be on the page (spacing-tolerant) — otherwise this could
+    # be a stale or unrelated render, and classifying it would be fabrication.
+    if tid and tid.replace(" ", "") not in body.replace(" ", "").replace("\n", ""):
+        return None
+    i = body.find("Tracking Details")
+    zone = body[i:]
+    # "Help and Support Center" is the end of the tracking content; everything
+    # after it is site chrome. (Cutting earlier at "Stay Safe" also works but
+    # would drop the Shipment Details block with the billed-on date.)
+    j = zone.find("Help and Support Center")
+    if j != -1:
+        zone = zone[:j]
+    marker = "Tracking No. or Delivery Notice"
+    m = zone.find(marker)
+    if m == -1:
+        return None
+    after = zone[m + len(marker):].strip()
+    status_line = after.split("\n", 1)[0].strip().lower()
+    status = None
+    for needles, name in (
+        (("out for delivery",), "Out for Delivery"),
+        (("delivered",), "Delivered"),
+        (("available for pickup", "hold at"), "Available for Pickup"),
+        (("return to sender", "delivery attempted", "exception"), "Exception"),
+        (("in transit", "on the way", "departed", "arrived at", "loaded on"),
+         "In Transit"),
+        (("we're preparing", "preparing your shipment", "label created",
+          "order processed", "billing information"), "Info Received"),
+    ):
+        if any(n in status_line for n in needles):
+            status = name
+            break
+    if not status:
+        return None          # an unknown current-status word is never guessed
+
+    seg = after[len(after.split("\n", 1)[0]):]
+    for end in ("View Package Location", "Show Details", "Proof of Delivery",
+                "Stay Safe"):
+        j = seg.find(end)
+        if j != -1:
+            seg = seg[:j]
+    drop = {tid, "content_copy", "Copy Tracking Number", "check", "close",
+            "Tracking number copied to clipboard.", "arrow_circle_right"}
+    lines = [ln.strip() for ln in seg.splitlines() if ln.strip()]
+    detail = " ".join(ln for ln in lines
+                      if ln not in drop and ln.lower() not in drop)
+    billed = re.search(r"Shipped / Billed On\s+([\d/]{8,10})", zone)
+    if billed and "billed" not in detail.lower():
+        detail = f"{detail} · Shipped / Billed On {billed.group(1)}"
+    detail = detail[:180].strip(" ,;:-—")
+    return status, detail
+
+
+def _parse_ups_json(data: dict, tid: str) -> Optional[Tuple[str, str]]:
+    """UPS guest API (webapis.ups.com/track/api/Track/GetStatus) parser.
+
+    Shape ground-truthed on a live capture (2026-09-24, a delivered shipment):
+    trackDetails[0] carries trackingNumber, packageStatus / packageStatusCode /
+    packageStatusType / progressBarType and milestones[] — each with name (the
+    localized label), nameKey (the stable CMS key: cms.stapp.delivered,
+    cms.stapp.outForDelivery, cms.stapp.inTransit, cms.stapp.orderReceived …),
+    isCompleted/isCurrent and a date.
+
+    The payload ECHOES the number, and this parser insists on it: a payload that
+    does not identify the shipment we asked about (mismatch, or no number at all)
+    fails closed instead of reporting another shipment's status.
+
+    Measured (2026-09-24): through the engine's own flow — warmup page + human
+    pause first — the call lands in ~9s end to end, so the spy is not slower than
+    the rendered page. On a COLD session (straight to the number URL, no warmup,
+    no interaction) it was ~95-110s, which is why the window is generous and the
+    whole phase is opt-in: a miss costs the window.
+    """
+    td = ((data or {}).get("trackDetails") or [{}])[0]
+    if not td or td.get("errorCode"):
+        return None                      # "not found"/"invalid number" envelope
+    num = str(td.get("trackingNumber")
+              or td.get("requestedTrackingNumber") or "")
+    num = num.replace(" ", "").upper()
+    if tid and (not num or num != tid.replace(" ", "").upper()):
+        return None
+    ms = td.get("milestones") or []
+    rel = [m for m in ms if m.get("isCurrent") or m.get("isCompleted")]
+    cur = [m for m in ms if m.get("isCurrent")]
+    # The CURRENT status decides — never history. Classifying on every completed
+    # milestone made "Label Created" answer for every package, which would also
+    # mask a new current status forever instead of reaching the log as unmapped.
+    pick = cur[0] if cur else (rel[-1] if rel else None)
+    flat = " ".join([
+        str(td.get("packageStatus") or ""),
+        str(td.get("progressBarType") or ""),
+        str((pick or {}).get("name") or ""),
+        str((pick or {}).get("nameKey") or ""),
+    ])
+    # nameKey is camelCase inside a dotted key (cms.stapp.outForDelivery), so
+    # compare on an alphanumeric-only lowercase form: both spellings collapse.
+    flat = re.sub(r"[^a-z0-9]", "", flat.lower())
+    for needles, name in (
+        (("outfordelivery",), "Out for Delivery"),
+        # Before "delivered": cms.stapp.deliveredToUAP is "Ready for Customer
+        # Pickup" and contains the word "delivered".
+        (("availableforpickup", "holdat", "readyforcustomerpickup",
+          "deliveredtouap"), "Available for Pickup"),
+        (("returntosender", "exception", "deliveryattempted"), "Exception"),
+        (("delivered",), "Delivered"),
+        (("intransit", "ontheway", "wehaveyourpackage", "dropoff",
+          "departed", "arrivedat", "loadedon"), "In Transit"),
+        (("orderreceived", "labelcreated", "preparing", "orderprocessed",
+          "billinginformation"), "Info Received"),
+    ):
+        if any(n in flat for n in needles):
+            status = name
+            break
+    else:
+        # Fail closed, but name the vocabulary so the next live capture extends
+        # the map instead of a guess shipping to users. These are enums; the
+        # recipient-bearing strings (receivedBy, addresses) stay out of the log.
+        LOGGER.info("UPS browser: unmapped status vocabulary for %s: %r/%r/%r",
+                    _mask(tid), td.get("packageStatusCode"),
+                    td.get("packageStatus"),
+                    [m.get("nameKey") for m in ms][:8])
+        return None
+    parts = []
+    if pick:
+        for key in ("name", "location", "date"):
+            value = str(pick.get(key) or "").strip()
+            if value:
+                parts.append(value)
+    if not parts:
+        parts.append(str(td.get("packageStatus") or "").strip())
+    return status, " · ".join(p for p in parts if p)[:180].strip(" ,;:-—")
+
+
+def _parse_fedex_json(data: dict, tid: str) -> Optional[Tuple[str, str]]:
+    """Spy wrapper (2026-09-20): logs the live payload's masked shape and the
+    statusDetail code/status pair so real boots confirm the parser's vocabulary
+    against observed data, then delegates to the implementation. The raw
+    `description` string is deliberately not logged — it can carry the
+    recipient's signature ("Signed for by …"). No tracking number appears here.
+    """
+    pkgs = ((data or {}).get("output") or {}).get("packages") or []
+    if _is_wtrk_shape(pkgs):
+        found = [q for q in pkgs if not q.get("notFound")]
+        errs = sorted({str(e.get("code")) for q in pkgs
+                       for e in (q.get("errorList") or []) if e.get("code")})
+        LOGGER.info(
+            "FedEx browser: payload shape (wtrk): %d package(s), %d found, "
+            "keyStatusCD=%r, errors=%s",
+            len(pkgs), len(found),
+            found[0].get("keyStatusCD") if found else None, errs or "none")
+    else:
+        sd = (pkgs[0].get("statusDetail") or {}) if pkgs else {}
+        scans = (pkgs[0].get("scanEvents") or []) if pkgs else []
+        LOGGER.info(
+            "FedEx browser: payload shape: %d package(s), %d scan(s); code=%r status=%r",
+            len(pkgs), len(scans),
+            sd.get("statusCode"), sd.get("status"))
+    res = _parse_fedex_json_impl(data, tid)
+    LOGGER.info("FedEx browser: parse outcome: %s",
+                "None (fail-closed)" if res is None else res[0])
+    return res
+
+
+def _parse_fedex_json_impl(data: dict, tid: str) -> Optional[Tuple[str, str]]:
+    """FedEx WTRK guest API (api.fedex.com/track/v2/shipments) parser.
+
+    Response shape ground-truthed on a live capture (2026-09-20, a real
+    delivered shipment): output.packages[0] carries statusDetail{statusCode,
+    status, description}, scanEvents[{date, eventCode, eventDescription,
+    scanLocation{city, stateOrProvinceCode, countryCode}}] and serviceDetail.
+    FedEx keeps public tracking data ~90 days after delivery; a purged number
+    comes back with no packages (fail closed like any other empty read).
+    Maps FedEx's human status strings onto the bot's vocabulary and fails
+    closed on anything unknown — the raw vocabulary is logged so the next
+    live capture teaches the mapping instead of a guess shipping.
+    """
+    pkgs = ((data or {}).get("output") or {}).get("packages") or []
+    if not pkgs:
+        return None
+    if _is_wtrk_shape(pkgs):
+        return _parse_fedex_wtrk(pkgs, tid)
+    p0 = pkgs[0]
+    sd = p0.get("statusDetail") or {}
+    blob = " ".join(str(sd.get(k) or "")
+                    for k in ("status", "description")).lower()
+    blob = f"{blob} {str(sd.get('statusCode') or '').lower()}"
+    if "delivered" in blob:
+        status = "Delivered"
+    elif "out for delivery" in blob or "on fedex vehicle" in blob:
+        status = "Out for Delivery"
+    elif "exception" in blob or "delay" in blob:
+        status = "Exception"
+    elif any(w in blob for w in ("in transit", "picked up", "departed",
+                                 "arrived at", "left fedex")):
+        status = "In Transit"
+    elif any(w in blob for w in ("label", "shipment information sent",
+                                 "pending", "tendered")):
+        status = "Info Received"
+    else:
+        # Fail closed — but name the vocabulary so the next live capture
+        # extends the map instead of a guess shipping to users. The description
+        # string stays out of the log: it can carry the recipient's signature.
+        LOGGER.info("FedEx browser: unmapped status vocabulary for %s: %r/%r",
+                    _mask(tid), sd.get("statusCode"), sd.get("status"))
+        return None
+    sev = p0.get("scanEvents") or []
+    detail = ""
+    if sev:
+        # Order is not documented — pick the newest scan by its ISO date
+        # instead of trusting the array direction.
+        e0 = max(sev, key=lambda e: str(e.get("date") or ""))
+        loc = e0.get("scanLocation") or {}
+        where = ", ".join(str(loc.get(k)) for k in
+                          ("city", "stateOrProvinceCode", "countryCode")
+                          if loc.get(k))
+        text = str(e0.get("eventDescription") or "").strip()
+        # Recipient signatures are the recipient's business, not card text.
+        text = text.split("Signed for by")[0].strip(" .,-")
+        parts = [text]
+        if where:
+            parts.append(where)
+        when = str(e0.get("date") or "").replace("T", " ")[:16]
+        if when:
+            parts.append(when)
+        detail = " · ".join(p for p in parts if p)
+    if not detail:
+        detail = (sd.get("description") or sd.get("status") or "").strip()
+    return status, detail[:180].strip(" ,;:-—")
+
+
+# FedEx's tracking web app (api.fedex.com/track/v2/shipments, as called by
+# www.fedex.com/fedextrack) answers in its own shape, NOT the documented
+# statusDetail/scanEvents one. Ground-truthed on live captures 2026-10-22:
+# packages[] each carry keyStatus/keyStatusCD, lastScanDateTime, a
+# scanEventList[{date, time, gmtOffset, status, statusCD, scanLocation (a
+# string), scanDetails}], boolean flags (delivered, notFound, ...) and an
+# errorList. A number FedEx doesn't know comes back as ONE package with
+# notFound=true and TRACKING.TRACKINGNUMBER.NOTFOUND; a reused number comes
+# back as several packages (duplicate=true), plus a notFound placeholder.
+_WTRK_CODE_MAP = {
+    "DL": "Delivered",
+    "OD": "Out for Delivery",
+    "DE": "Exception", "SE": "Exception", "CD": "Exception", "DY": "Exception",
+    "CA": "Exception", "RS": "Exception",
+    "HL": "Available for Pickup", "HP": "Available for Pickup",
+    "OC": "Info Received", "IN": "Info Received",
+    "PU": "In Transit", "IT": "In Transit", "AR": "In Transit",
+    "AF": "In Transit", "DP": "In Transit", "CC": "In Transit",
+    "PM": "In Transit", "AA": "In Transit", "AD": "In Transit",
+    "OW": "In Transit", "DF": "In Transit", "TR": "In Transit",
+    "FD": "In Transit", "EP": "In Transit", "AP": "In Transit",
+}
+
+
+def _is_wtrk_shape(pkgs) -> bool:
+    return any(isinstance(q, dict) and ("keyStatusCD" in q or "scanEventList" in q
+                                        or "notFound" in q) for q in pkgs)
+
+
+def _wtrk_status(q: dict) -> Optional[str]:
+    if q.get("delivered"):
+        return "Delivered"
+    for code in (q.get("keyStatusCD"), q.get("statusBarCD")):
+        st = _WTRK_CODE_MAP.get(str(code or "").upper())
+        if st:
+            return st
+    text = " ".join(str(q.get(k) or "") for k in
+                    ("keyStatus", "mainStatus", "lastScanStatus")).lower()
+    if "delivered" in text and "not delivered" not in text:
+        return "Delivered"
+    if "out for delivery" in text or "on fedex vehicle" in text:
+        return "Out for Delivery"
+    if "exception" in text or "delay" in text:
+        return "Exception"
+    if "ready for pickup" in text or "available for pickup" in text:
+        return "Available for Pickup"
+    if "label created" in text or "shipment information sent" in text \
+            or "initiated" in text:
+        return "Info Received"
+    if any(w in text for w in ("on the way", "in transit", "picked up",
+                               "departed", "arrived", "delivery updated")):
+        return "In Transit"
+    return None
+
+
+def _parse_fedex_wtrk(pkgs, tid: str) -> Optional[Tuple[str, str]]:
+    found = [q for q in pkgs if isinstance(q, dict) and not q.get("notFound")]
+    if not found:
+        LOGGER.info("FedEx browser: %s not found at FedEx (no data yet)", _mask(tid))
+        return None
+    # A reused number returns several shipments; the newest is the live one.
+    q = max(found, key=lambda x: str(x.get("lastScanDateTime") or x.get("shipDt") or ""))
+    status = _wtrk_status(q)
+    if not status:
+        LOGGER.info("FedEx browser: unmapped wtrk vocabulary for %s: %r/%r",
+                    _mask(tid), q.get("keyStatusCD"), q.get("keyStatus"))
+        return None
+    events = [e for e in (q.get("scanEventList") or []) if e.get("date")]
+    detail = ""
+    if events:
+        e0 = max(events, key=lambda e: f"{e.get('date')} {e.get('time') or ''}")
+        text = str(e0.get("status") or "").strip()
+        extra = str(e0.get("scanDetails") or "").strip()
+        if extra and extra.lower() not in text.lower():
+            text = f"{text} — {extra}"
+        # Recipient signatures are the recipient's business, not card text.
+        text = text.split("Signed for by")[0].strip(" .,-—")
+        when = f"{e0.get('date')} {str(e0.get('time') or '')[:5]}".strip()
+        detail = " · ".join(p for p in (text, str(e0.get("scanLocation") or "").strip(),
+                                       when) if p)
+    if not detail:
+        detail = str(q.get("keyStatus") or q.get("mainStatus") or "").strip()
+    return status, detail[:180].strip(" ,;:-—")
+
+
+def _parse_dhl_body(body: str, tid: str) -> Optional[Tuple[str, str]]:
+    """Parse the rendered dhl.com Track & Trace page into (status, detail), or
+    None. Live fixture (2026-09-18, DHL Global Forwarding sample shipment): the
+    results panel shows "Shipment Delivered", "Last Update: <date time (UTC
+    offset)>, <loc>", "Origin: …", "Destination: …".
+
+    DHL's SPA ignores URL parameters — the number only answers after being
+    typed into the search box and submitted (the caller does that). This parser
+    fails closed: no "Tracking Results" panel, no recognizable "Shipment …"
+    phrase, or a missing number all mean None (a retry signal, never a guess).
+    """
+    if not body or "Tracking Results" not in body:
+        return None
+    if tid and tid.replace(" ", "") not in body.replace(" ", "").replace("\n", ""):
+        return None
+    i = body.find("Tracking Results")
+    zone = body[i:]
+    j = zone.find("Track & Trace FAQs")
+    if j != -1:
+        zone = zone[:j]
+    status = None
+    for needles, name in (
+        (("shipment delivered",), "Delivered"),
+        (("shipment in transit", "shipment processed", "shipment departed"),
+         "In Transit"),
+        (("shipment delivery attempted", "shipment returned",
+          "shipment on hold", "shipment delayed"), "Exception"),
+        (("shipment information received", "shipment pending",
+          "shipment pre-transit"), "Info Received"),
+    ):
+        if any(n in zone.lower() for n in needles):
+            status = name
+            break
+    if not status:
+        return None          # an unknown DHL status phrase is never guessed
+
+    parts = []
+    m = re.search(r"Last Update:\s*(.+?\(UTC[^)]*\))", zone)
+    if m:
+        parts.append("Last Update: " + " ".join(m.group(1).split()))
+    for field in ("Origin", "Destination"):
+        fm = re.search(field + r":\s*([^\n]+)", zone)
+        if fm:
+            parts.append(f"{field}: {' '.join(fm.group(1).split())}")
+    detail = " · ".join(parts)[:180].strip(" ,;:-—")
+    return status, detail
+
+
+# Carrier → (label, kind, warm-up page, per-number URL or form fields, parser).
+# kind "url": the number is a URL parameter (navigate per number). kind "form":
+# the SPA ignores URL parameters and only answers its own search box — the
+# caller fills the input and submits, exactly what a person does. Parsers take
+# (body, tid) and fail closed. The warm-up load refreshes the trust cookies
+# once per session.
+_CARRIER_PAGES = {
+    "usps": {
+        "label": "USPS",
+        "kind": "url",
+        "warmup": "https://tools.usps.com/track.htm",
+        "url": lambda tid: f"https://tools.usps.com/tracking/{tid}",
+        "parse": lambda body, tid: _result_from_body(body),
+    },
+    "ups": {
+        "label": "UPS",
+        "kind": "url",
+        "warmup": "https://www.ups.com/track?loc=en_US",
+        "url": lambda tid: f"https://www.ups.com/track?tracknum={tid}&loc=en_US",
+        "parse": _parse_ups_body,
+        # OPT-IN spy (UPS_BROWSER_JSON): ride the page's own guest API call, the
+        # FedEx trick. Off by default — the rendered page already answers.
+        #
+        # ORDER (prefer="page"): the page is read FIRST and the spy is the
+        # fallback, because the page always renders while the API call only
+        # fires sometimes (measured 6 of 6 windows at 9-12s on 2026-09-24, then
+        # 1-in-3 and 0-in-2 under probe pressure an hour later). Gating on a
+        # call that may not come is what made the tier's latency unpredictable;
+        # as a fallback it costs nothing on the fast path and still rescues a
+        # number whose page rendered nothing.
+        "prefer": "page",
+        # 0 = a fired window that carried no data ends the attempt (the 47s
+        # no-data path measured 2026-09-24). FedEx keeps the default of 1, where
+        # one more chance matters because its spy is the ONLY signal.
+        "empty_retries": 0,
+        "json_watch": {
+            "api_match": lambda r: ("webapis.ups.com/track/api/Track/GetStatus"
+                                    in r.url and r.request.method == "POST"),
+            # 2.5x the measured 9-12s latency. A miss costs this window, so it is
+            # sized from data, not from the worst cold reading: the same
+            # measurement that found the 9-12s fire also showed a 115s window
+            # paying 116s for one number the carrier simply has no data for.
+            "api_wait_ms": 30000,
+            "parse_json": _parse_ups_json,
+        },
+    },
+    "dhl": {
+        "label": "DHL",
+        "kind": "form",
+        "warmup": "https://www.dhl.com/global-en/home/tracking.html",
+        "inputs": ("input[name='tracking-id']", "input[id*='tracking' i]",
+                   "input[aria-label*='tracking' i]",
+                   "input[placeholder*='tracking' i]", "input[type='search']"),
+        "submits": ("button:has-text('Track')", "button[type='submit']",
+                    "input[type='submit']", "a:has-text('Track')"),
+        "parse": _parse_dhl_body,
+    },
+    "fedex": {
+        "label": "FedEx",
+        "kind": "json-watch",
+        # The wtrk app boots with the number preloaded and POSTs its own
+        # guest API call (api.fedex.com/track/v2/shipments). Everything else
+        # is unreliable: the rendered UI says "can't find that tracking
+        # number" on LIVE data (measured 2026-09-20), and our synthetic
+        # fetch/XHR/plain-HTTP are all refused by the Akamai edge — only the
+        # SPA's own request carries valid sensor state. So: boot the page,
+        # take the API response body, parse the JSON.
+        "warmup": "https://www.fedex.com/wtrk/track/",
+        # No warm-up load for FedEx. Measured 2026-10-22 (scripts/fedex_spy.py):
+        # the tracking app only calls track/v2/shipments on the FIRST app load
+        # in a session — after any warm-up (wtrk or fedextrack root) the second
+        # load never fires it (NEVER CALLED in 2 of 2 warm-up scenarios, FIRED
+        # 200 with no warm-up). The warm-up is what broke every FedEx lookup.
+        "skip_warmup": True,
+        # The "already booted" state also survives in a REUSED profile, and
+        # wiping the app's storage does not clear it (spy H/I, 2026-10-22).
+        # What works every time is the first load in a fresh profile — so each
+        # FedEx number gets its own fresh session, with no in-session retry
+        # (a retry is a second load and never fires). The next sweep retries.
+        "fresh_profile": True,
+        "batch_max": 1,
+        "max_attempts": 1,
+        # /fedextrack/ (not /wtrk/track/): probe 2026-10-22 — with the copied
+        # profile, the wtrk route calls user/v4/login/validate, gets 401
+        # "session expired" and never fires the shipments API; fedextrack
+        # skips that check and fires it (200).
+        "url": lambda tid: f"https://www.fedex.com/fedextrack/?trknbr={tid}",
+        "api_match": lambda r: ("api.fedex.com/track/v2/shipments" in r.url
+                                and r.request.method == "POST"),
+        # 3x the measured first-fire latency: 6.0-7.8s, in 6 of 6 runs, and it
+        # fired again in every retry window (2026-09-24). The 55s that used to
+        # sit here came from an older "~1 in 2-3 boots" reading: it cost 55s per
+        # miss and squeezed how many numbers a session's budget could fit.
+        "api_wait_ms": 25000,
+        "parse_json": _parse_fedex_json,
+    },
+}
+
+
+def browser_slugs() -> Tuple[str, ...]:
+    """Slugs this module can read in a browser (carriers.py consults this).
+    Slugs listed in USPS_BROWSER_DISABLED_SLUGS are filtered out — a disabled
+    carrier is never swept and never taken on demand."""
+    return tuple(s for s in _CARRIER_PAGES if s not in _DISABLED_SLUGS)
+
+
+def page_label(slug: str) -> str:
+    """Human carrier name for log/source labels ('USPS', 'UPS', ...)."""
+    return _CARRIER_PAGES.get(slug, {}).get("label", slug.upper())
+
+
+def _batch_chunks(tracking_ids: List[str],
+                  size: Optional[int] = None) -> List[List[str]]:
+    """Split tracking numbers into sessions of at most USPS_BATCH_MAX (or a
+    carrier's own smaller batch_max)."""
+    size = max(1, min(size or USPS_BATCH_MAX, USPS_BATCH_MAX))
+    return [tracking_ids[i:i + size] for i in range(0, len(tracking_ids), size)]
+
+
+def _human_pause(page, moves: int = 8) -> None:
+    """Trusted-input 'breathing': random mouse wiggle + a small scroll so the
+    Akamai sensor sees human-like activity between navigations instead of a
+    load-and-jump bot pattern."""
+    import random
+    try:
+        x, y = random.randint(80, 600), random.randint(80, 400)
+        for _ in range(moves):
+            x = max(20, min(1400, x + random.randint(-200, 240)))
+            y = max(20, min(850, y + random.randint(-140, 180)))
+            page.mouse.move(x, y, steps=random.randint(4, 10))
+            time.sleep(random.uniform(0.08, 0.3))
+        page.mouse.wheel(0, random.randint(200, 500))
+        time.sleep(0.4)
+        page.mouse.wheel(0, -random.randint(100, 300))
+        time.sleep(random.uniform(0.5, 1.5))
+    except Exception:
+        pass
+
+
+def _spy_config(cfg: dict) -> Optional[dict]:
+    """The ONE spy wrapper: a window on the carrier's own API call.
+
+    Both carriers describe the same three things, and this is the single place
+    that knows the two legacy spellings:
+      * FedEx (``kind: "json-watch"``) — top-level api_match/api_wait_ms/parse_json,
+        because the rendered UI lies and the spy is the carrier's only signal.
+      * UPS (nested ``json_watch``) — the same shape, but opt-in behind
+        UPS_BROWSER_JSON, because its rendered page already answers.
+
+    Returns None when the carrier has no spy, or its gate is off, so callers can
+    ask "is there a spy here?" without knowing either spelling.
+    """
+    if cfg.get("kind") == "json-watch":
+        spy = cfg
+    elif cfg.get("json_watch") and UPS_BROWSER_JSON:
+        spy = cfg["json_watch"]
+    else:
+        return None
+    if not (spy.get("api_match") and spy.get("parse_json")):
+        return None
+    return {"match": spy["api_match"],
+            "wait_ms": spy.get("api_wait_ms", 55000),
+            "parse": spy["parse_json"]}
+
+
+def _reset_origin_state(page, origins) -> None:
+    """Wipe a carrier app's saved browser state (localStorage, sessionStorage,
+    IndexedDB, service workers, Cache Storage) for the given origins, keeping
+    cookies. Used by scripts/fedex_spy.py. MEASURED NOT TO HELP FedEx
+    (2026-10-22, spy H/I): the app still never re-fires its shipments API
+    after a wipe, so the bot uses a fresh profile per FedEx number instead."""
+    try:
+        page.evaluate("() => { try { sessionStorage.clear() } catch (e) {} "
+                      "try { localStorage.clear() } catch (e) {} }")
+    except Exception:
+        pass
+    try:
+        cdp = page.context.new_cdp_session(page)
+        try:
+            for origin in origins:
+                cdp.send("Storage.clearDataForOrigin", {
+                    "origin": origin,
+                    "storageTypes": "local_storage,indexeddb,service_workers,"
+                                    "cache_storage,websql,file_systems"})
+        finally:
+            cdp.detach()
+    except Exception as e:
+        LOGGER.info("browser: origin state reset skipped (%s)", type(e).__name__)
+
+
+class _SkipWarmup(Exception):
+    """Internal: lets a carrier opt out of the session warm-up load."""
+
+
+def _window_fits(started_at: float, wait_ms: int, timeout_budget: int) -> bool:
+    """The sweep budget is a contract: a window is only opened when it fits
+    whole, so an attempt cannot be cut off mid-wait."""
+    return (time.monotonic() - started_at) + wait_ms / 1000 <= timeout_budget
+
+
+def _reach(page, cfg: dict, slug: str, tid: str) -> bool:
+    """Go to the number's page, the way the carrier expects it. True when the
+    page (and, for a form carrier, the submitted search) was reached.
+
+    "url" carriers take the number as a parameter; "form" carriers (DHL) ignore
+    parameters and only answer their own search box, so behave like a person:
+    fresh page, dismiss the consent overlay that intercepts clicks, fill, submit.
+    A form carrier with no matching input returns False — the caller stops the
+    attempt instead of polling a page that was never asked anything.
+    """
+    if cfg.get("kind") == "form":
+        resp = page.goto(cfg["warmup"], wait_until="domcontentloaded", timeout=40000)
+        _note_edge_refusal(slug, resp.status if resp else None, warmup=True)
+        time.sleep(2.0)   # let the SPA hydrate
+        for sel in ("#onetrust-accept-btn-handler",
+                    "button:has-text('Accept all')",
+                    "button:has-text('Accept All')"):
+            loc = page.locator(sel)
+            if loc.count():
+                try:
+                    loc.first.click()
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+        filled = False
+        for sel in cfg["inputs"]:
+            loc = page.locator(sel)
+            if loc.count():
+                loc.first.click()
+                loc.first.fill(tid)
+                filled = True
+                break
+        if not filled:
+            LOGGER.warning("%s browser: no search input matched", cfg["label"])
+            return False
+        clicked = False
+        for sub in cfg["submits"]:
+            loc = page.locator(sub)
+            if loc.count():
+                loc.first.click()
+                clicked = True
+                break
+        if not clicked:
+            page.keyboard.press("Enter")
+        return True
+    resp = page.goto(cfg["url"](tid), wait_until="domcontentloaded", timeout=40000)
+    _note_edge_refusal(slug, resp.status if resp else None)
+    return True
+
+
+def _spy_attempt(page, spy: dict, cfg: dict, tid: str, slug: str,
+                 label: str, attempt: int) -> Tuple[Optional[Tuple[str, str]],
+                                                    bool]:
+    """One spy attempt: navigate inside the window, take the carrier's OWN API
+    response, parse it. Returns (result, no_data).
+
+    A MISS is the (None, False) pair: the window timed out, or the context came
+    back without a response object (how the tests model a timeout) — that stays
+    retryable. no_data (None, True) means the window FIRED and carried nothing
+    for this number, which is the carrier's answer, not a transient miss.
+
+    A block page ends the attempt at once: a 200 deny page never fires the
+    carrier's own API call, so waiting the full api_wait_ms for it is pure
+    waste — and the armed throttle stops the attempt loop from navigating
+    into the same wall again. The blocked outcome survives the empty-result
+    bookkeeping, and the debug capture still fires so we learn the wording.
+    """
+    result, no_data = None, False
+    blocked = False
+    try:
+        with page.expect_response(spy["match"], timeout=spy["wait_ms"]) as rinfo:
+            resp = page.goto(cfg["url"](tid), wait_until="domcontentloaded",
+                             timeout=40000)
+            _note_edge_refusal(slug, resp.status if resp else None)
+            # A 200 deny page renders HERE, before the API window could ever
+            # fire. Raising inside the window cancels the wait (no timeout
+            # burn) and lands in the blocked path below.
+            body = ""
+            try:
+                body = page.inner_text("body")
+            except Exception:
+                pass
+            if _looks_blocked(body):
+                raise _BlockPageSignal()
+        caught = rinfo.value
+        if caught is not None:
+            # The carrier's own API can be refused too — a 403/429 there is a
+            # hard edge refusal, not an empty payload.
+            if getattr(caught, "status", None) in (403, 429):
+                _note_edge_refusal(slug, caught.status)
+            else:
+                # Parse FIRST. The human-activity gesture is for the sensor's
+                # view of a NAVIGATION (the warmup pause covers load 1, the
+                # retry pause covers reloads) — it does not belong between the
+                # response and the parse, where it measured 2-4s per success.
+                result = spy["parse"](caught.json(), tid)
+                no_data = result is None
+    except _BlockPageSignal:
+        blocked = True
+    except Exception as e:
+        LOGGER.info("%s browser: API window missed on attempt %d (%s)",
+                    label, attempt, type(e).__name__)
+    if blocked:
+        _note_block_page(slug)
+        _note_outcome(tid, "blocked")
+    return result, no_data
+
+
+# Block-page detection: Akamai often answers HTTP 200 with a tiny deny or
+# challenge page, which used to read as a slow render and got retried up to
+# three times — handing the bot defense three more signals per miss. These
+# markers are standard Akamai deny wording ("Reference #…" ids and the
+# edgesuite error host); they are ASSUMED, not yet observed on a USPS block —
+# a USPS_DEBUG_DIR capture of a real block will show the true wording to
+# tighten them. The size guard keeps a long, legitimate result page (the
+# delivered page measured ~4.8k chars) from ever matching.
+_BLOCK_MAX_CHARS = 4096
+_BLOCK_MARKERS = ("access denied", "reference #", "errors.edgesuite.net")
+
+
+class _BlockPageSignal(Exception):
+    """Raised inside an expect_response window to cancel the wait the moment
+    a block page renders — the window could never succeed on that page."""
+
+
+def _looks_blocked(text: str) -> bool:
+    """True when a SHORT body carries a known block-page marker."""
+    if not text or len(text) > _BLOCK_MAX_CHARS:
+        return False
+    low = text.lower()
+    return any(marker in low for marker in _BLOCK_MARKERS)
+
+
+def _poll_page(page, cfg: dict, tid: str, slug: str, deadline: float
+               ) -> Optional[Tuple[str, str]]:
+    """Poll the SAME loaded page until its text parser answers.
+
+    Skipped entirely for a carrier with no text parser (FedEx: the rendered UI
+    lies, so its spy is the only signal). "Tracking Number:" alone means the page
+    SHELL rendered, not the result — stopping there used to hand an unrendered
+    page to the parser, which then fabricated a status from nav text.
+
+    A block page stops the poll at once and refuses the carrier (per-carrier
+    escalating backoff), so the attempt loop ends instead of re-navigating
+    into the same wall. The blocked outcome stays on the number even when the
+    empty-result bookkeeping runs afterwards.
+    """
+    parse = cfg.get("parse")
+    if not parse:
+        return None
+    while time.monotonic() < deadline:
+        time.sleep(1.3)
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            continue
+        res = parse(body, tid)
+        if res:
+            return res
+        if _looks_blocked(body):
+            _note_block_page(slug)
+            _note_outcome(tid, "blocked")
+            return None
+    return None
+
+
+def _check_batch_chunk_locked(chunk: List[str], timeout_budget: int,
+                              slug: str = "usps",
+                              headful: Optional[bool] = None
+                              ) -> Dict[str, Tuple[str, str]]:
+    """Run ONE browser session for a chunk (≤ USPS_BATCH_MAX numbers): a single
+    profile snapshot + single context, visiting each widget in turn. The carrier
+    (warm-up page, per-number URL, parser) comes from _CARRIER_PAGES."""
+    cfg = _CARRIER_PAGES[slug]
+    label = cfg["label"]
+    spy = _spy_config(cfg)
+    if spy:
+        # A spy needs warmup + one full API window to do anything; a smaller
+        # budget is meaningless, so floor it. Sweep callers (120s) are unaffected
+        # by max(). One floor for both spellings now that there is one wrapper.
+        timeout_budget = max(timeout_budget, 15 + int(spy["wait_ms"] / 1000))
+    results: Dict[str, Tuple[str, str]] = {}
+    # Reuse a warm profile copy while it is under _PROFILE_MAX_AGE: the first
+    # version rmtree'd it on every batch, which paid the ~50 MB re-copy every
+    # time AND dropped the Akamai-trusted cookies that make the tier work —
+    # making the 2-hour reuse logic in _ensure_profile_copy unreachable. A fresh
+    # or stale copy still gets rebuilt (by that same check downstream).
+    copy_path = _profile_copy_for(slug)
+    if cfg.get("fresh_profile") or not _profile_copy_is_warm(copy_path):
+        shutil.rmtree(copy_path, ignore_errors=True)
+    copy = _ensure_profile_copy(copy_path)
+    if not copy:
+        LOGGER.warning("%s browser: no Chrome profile to copy — skipping %d "
+                       "number(s)", label, len(chunk))
+        for t_ in chunk:
+            _note_outcome(t_, "no_profile")
+        return results
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        LOGGER.warning("%s browser: playwright unavailable — skipping %d "
+                       "number(s)", label, len(chunk))
+        for t_ in chunk:
+            _note_outcome(t_, "no_playwright")
+        return results
+
+    started_at = time.monotonic()
+    per_id = max(8, min(30, timeout_budget // max(1, len(chunk))))
+    LOGGER.info("%s browser: batch checking %d number(s) (budget %ds, %ds/item)",
+                label, len(chunk), timeout_budget, per_id)
+    try:
+        with sync_playwright() as p:
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir=copy,
+                headless=not _resolve_headful(headful),
+                executable_path=CHROME_PATH,
+                user_agent=current_ua(),  # matches installed Chrome; never "HeadlessChrome"
+                # Real-machine geometry: inner 1366x870 inside a maximized
+                # window on the 1512x982 @2x Retina screen the _STEALTH
+                # spoof reports (matches the cookie source window).
+                viewport={"width": 1366, "height": 870},
+                device_scale_factor=2,
+                args=["--disable-blink-features=AutomationControlled",
+                      "--disable-extensions", "--window-position=60,60"],
+            )
+            try:
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                page.add_init_script(_STEALTH)
+                # Warm the session ONCE — the trust cookies refresh on a real load.
+                # Skipped for carriers whose app answers only on its first load.
+                try:
+                    if cfg.get("skip_warmup"):
+                        raise _SkipWarmup()
+                    resp = page.goto(cfg["warmup"],
+                              wait_until="domcontentloaded", timeout=40000)
+                    _note_edge_refusal(
+                        slug, resp.status if resp else None, warmup=True)
+                    _human_pause(page)
+                except Exception:
+                    pass
+                saw_success = False
+                for idx, tid in enumerate(chunk):
+                    if is_throttled(slug) or time.monotonic() - started_at > timeout_budget:
+                        LOGGER.warning("%s browser: stopping early (throttle or budget)", label)
+                        reason = "throttled" if is_throttled(slug) else "timeout"
+                        for t_ in chunk[idx:]:
+                            _note_outcome(t_, reason)
+                        break
+                    res = None
+                    try:
+                        # Akamai's verdict is intermittent — retry the same URL
+                        # up to 3 times with a human pause between attempts.
+                        attempts_made = 0
+                        empty_fires = 0
+                        max_empty = int(cfg.get("empty_retries", 1))
+                        poll_for = 8 if idx == 0 else per_id
+                        prefer_page = cfg.get("prefer") == "page"
+                        for attempt in range(int(cfg.get("max_attempts", 3))):
+                            attempts_made += 1
+                            if is_throttled(slug) or \
+                                    time.monotonic() - started_at > timeout_budget:
+                                break
+                            res = None
+                            spy_empty = False
+                            # The sweep budget is a contract: a window is only
+                            # opened when it fits whole. A carrier whose ONLY
+                            # signal is the spy cannot do anything without one.
+                            if spy and not _window_fits(started_at, spy["wait_ms"],
+                                                        timeout_budget):
+                                if not cfg.get("parse"):
+                                    break
+                                LOGGER.info("%s browser: JSON window skipped — "
+                                            "no room in this budget", label)
+                                usable_spy = None
+                            else:
+                                usable_spy = spy
+                            if prefer_page:
+                                # Page first: it always renders and costs nothing
+                                # when it answers, so the spy is the second
+                                # chance (it re-navigates inside its own window).
+                                if not _reach(page, cfg, slug, tid):
+                                    break
+                                res = _poll_page(page, cfg, tid, slug,
+                                                 time.monotonic() + poll_for)
+                                # A blocked page already armed the throttle —
+                                # don't spend a spy window on the same wall.
+                                if not res and usable_spy and not is_throttled(slug):
+                                    res, spy_empty = _spy_attempt(
+                                        page, usable_spy, cfg, tid, slug, label,
+                                        attempts_made)
+                            elif usable_spy:
+                                # Spy first (FedEx has no other signal; UPS only
+                                # in "first" mode): one navigation carries both.
+                                res, spy_empty = _spy_attempt(
+                                    page, usable_spy, cfg, tid, slug, label,
+                                    attempts_made)
+                                if not res:
+                                    res = _poll_page(page, cfg, tid, slug,
+                                                     time.monotonic() + poll_for)
+                            else:
+                                if not _reach(page, cfg, slug, tid):
+                                    break
+                                res = _poll_page(page, cfg, tid, slug,
+                                                 time.monotonic() + poll_for)
+                            if res:
+                                saw_success = True
+                                results[tid] = res
+                                _note_outcome(tid, "ok")
+                                _note_edge_success(slug)
+                                break
+                            if spy_empty:
+                                # A fired window that carried no data is the
+                                # carrier's ANSWER for this number: a retry
+                                # re-sends the same request for the same number.
+                                # empty_retries bounds it — 0 stops at once, 1
+                                # gives a transient empty payload one more chance.
+                                empty_fires += 1
+                                if empty_fires > max_empty:
+                                    LOGGER.info("%s browser: API fired but had no "
+                                                "data for %s — not retrying",
+                                                label, _mask(tid))
+                                    break
+                            if attempt < 2:
+                                _human_pause(page)
+                        if not res:
+                            LOGGER.warning("%s browser: batch item %s came back empty "
+                                           "(after %d attempts)", label, _mask(tid), attempts_made)
+                            outcome = "no_data"
+                            try:
+                                body_text = page.inner_text("body")
+                                _save_debug_capture(slug, tid, body_text)
+                                if "Tracking Number:" in body_text or \
+                                        "Latest Update" in body_text:
+                                    outcome = "parse_failed"
+                            except Exception:
+                                pass
+                            if _LAST_OUTCOME.get(tid) != "blocked":
+                                _note_outcome(tid, outcome)
+                            if not saw_success:
+                                LOGGER.warning("%s browser: first item empty — session not "
+                                               "rendering (headless/Akamai), aborting remaining %d",
+                                               label, max(0, len(chunk) - idx - 1))
+                                for t_ in chunk[idx + 1:]:
+                                    _note_outcome(t_, "aborted")
+                                break
+                    except Exception as e:
+                        # type name only: Playwright's TimeoutError text embeds the
+                        # navigated URL, and that URL carries the raw tracking id —
+                        # _mask(tid) covers the argument, never the exception text.
+                        LOGGER.warning("%s browser: batch item %s failed: %s",
+                                       label, _mask(tid), type(e).__name__)
+                        _note_outcome(tid, "error")
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        LOGGER.warning("%s browser: batch session failed: %s", label, type(e).__name__)
+    return results
+
+
+def _check_batch_chunk(chunk: List[str], timeout_budget: int,
+                       slug: str = "usps",
+                       headful: Optional[bool] = None
+                       ) -> Dict[str, Tuple[str, str]]:
+    """_check_batch_chunk_locked under the cross-process profile lock. The
+    lock is best-effort: another PROCESS holding it skips this batch (busy);
+    an unusable lock file runs unlocked. Nothing changes within one process —
+    the semaphore in carriers._browser_slot already serializes there."""
+    results: Dict[str, Tuple[str, str]] = {}
+    lock_fh, busy = _acquire_profile_lock(_profile_copy_for(slug))
+    if busy:
+        LOGGER.warning("%s browser: another session holds the profile lock — "
+                       "skipping %d number(s)",
+                       _CARRIER_PAGES[slug]["label"], len(chunk))
+        for t_ in chunk:
+            _note_outcome(t_, "busy")
+        return results
+    try:
+        results = _check_batch_chunk_locked(chunk, timeout_budget, slug,
+                                            headful=headful)
+        # Chrome is closed and the lock is still ours: strip the cookies the
+        # session accumulated before releasing it (prune-end).
+        _prune_session_cookies(slug)
+        return results
+    finally:
+        _release_profile_lock(lock_fh)
+
+
+def get_browser_statuses(slug: str, tracking_ids: list,
+                         timeout_budget: int = 120,
+                         headful: Optional[bool] = None
+                         ) -> Dict[str, Tuple[str, str]]:
+    """Check many numbers of ONE carrier in session batches of at most
+    USPS_BATCH_MAX. Larger sets are split so no single session hammers the
+    carrier — which is what triggers bot flags."""
+    if slug not in _CARRIER_PAGES:
+        return {}
+    results: Dict[str, Tuple[str, str]] = {}
+    ids = [t for t in tracking_ids if t]
+    if not ids:
+        return results
+    if is_throttled(slug):
+        LOGGER.warning("%s browser: throttled — skipping %d number(s)",
+                       _CARRIER_PAGES[slug]["label"], len(ids))
+        for t_ in ids:
+            _note_outcome(t_, "throttled")
+        return results
+    for chunk in _batch_chunks(ids, _CARRIER_PAGES[slug].get("batch_max")):
+        if is_throttled(slug):
+            LOGGER.warning("%s browser: throttled mid-batch — stopping early",
+                           _CARRIER_PAGES[slug]["label"])
+            for t_ in ids:
+                if t_ not in results and t_ not in _LAST_OUTCOME:
+                    _note_outcome(t_, "throttled")
+            break
+        results.update(_check_batch_chunk(chunk, timeout_budget, slug,
+                                          headful=headful))
+    return results
+
+
+def get_browser_status(slug: str, tracking_id: str,
+                       timeout_budget: int = 55,
+                       headful: Optional[bool] = None
+                       ) -> Optional[Tuple[str, str]]:
+    """Single-number convenience — same profile/UA/stealth/headless path as the
+    batch. headful=None keeps the module default; True/False overrides it for
+    this call only."""
+    if not tracking_id or slug not in _CARRIER_PAGES:
+        return None
+    return get_browser_statuses(slug, [tracking_id], timeout_budget,
+                                headful=headful).get(tracking_id)
+
+
+def get_usps_statuses(tracking_ids: list, timeout_budget: int = 120) -> Dict[str, Tuple[str, str]]:
+    """Backward-compatible wrapper: USPS numbers through the generic engine."""
+    return get_browser_statuses("usps", tracking_ids, timeout_budget)
+
+
+def diagnose_profile() -> dict:
+    """Metadata-only health report on the profile-copy mechanism: mode and
+    paths, whether the source profile and the copy exist, the copy's age per
+    the .created_at marker, the copy's file list (name, bytes, mode) and
+    cookie ROW counts per Cookies file — never cookie names or values — plus
+    whether Chrome's own Default/ tree appeared inside the copy after a
+    session (the check for where Chrome actually reads its cookies). Safe to
+    paste into a bug report."""
+    report: dict = {
+        "mode": USPS_PROFILE_MODE,
+        "source": CHROME_PROFILE,
+        "source_exists": os.path.isdir(CHROME_PROFILE),
+        "copy": _PROFILE_COPY,
+        "copy_exists": os.path.isdir(_PROFILE_COPY),
+    }
+    if report["copy_exists"]:
+        try:
+            marker = os.path.join(_PROFILE_COPY, _CREATED_MARKER)
+            report["copy_age_seconds"] = int(
+                time.time() - os.path.getmtime(marker))
+        except OSError:
+            report["copy_age_seconds"] = None
+        files = []
+        total_rows = 0
+        for root_2, _dirs_2, files_2 in os.walk(_PROFILE_COPY):
+            for fname in files_2:
+                path = os.path.join(root_2, fname)
+                try:
+                    entry = {"file": os.path.relpath(path, _PROFILE_COPY),
+                             "bytes": os.path.getsize(path),
+                             "mode": oct(os.stat(path).st_mode & 0o777)}
+                except OSError:
+                    continue
+                files.append(entry)
+                if fname == "Cookies":
+                    try:
+                        import sqlite3
+                        con = sqlite3.connect(path)
+                        entry["cookie_rows"] = con.execute(
+                            "SELECT COUNT(*) FROM cookies").fetchone()[0]
+                        con.close()
+                        total_rows += entry["cookie_rows"]
+                    except Exception:
+                        pass
+        report["files"] = files
+        report["cookie_rows_total"] = total_rows
+    return report

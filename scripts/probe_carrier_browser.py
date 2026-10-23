@@ -1,0 +1,702 @@
+"""probe_carrier_browser.py — feasibility probe for browser tiers on UPS/FedEx/DHL.
+
+Same job scripts/pb_probe.py and scripts/ship24_probe.py had: decide whether a
+source is worth wiring up BEFORE any app module learns about it. Here the
+question is narrower and nastier — can a headless Chrome session, reusing the
+same real-Chrome cookie profile that defeats USPS/Akamai, actually READ a
+status from ups.com, fedex.com and dhl.com? Those three are the most
+aggressively bot-protected tracking pages in the business, so the answer may
+differ per carrier (and DHL may not need a browser at all).
+
+For each carrier the probe tries, cheapest first:
+  1. plain HTTP on the JSON endpoints the tracking pages themselves call
+     (no browser, no playwright — if one of these answers, the tier should use
+      it and skip the browser entirely, like the OnTrac scrape does),
+  2. headless Chrome on the public tracking URLs, reusing usps_browser's
+     profile copy + stealth, and dumping every XHR the page makes,
+  3. batching: one session, several numbers — because every session shares one
+     Chrome user_data_dir and the bot serializes browser work, a carrier that
+     cannot be batched costs one session PER NUMBER.
+
+Nothing here is imported by the bot. Tracking numbers are masked in every line
+of output (including inside printed URLs) and page text saved for fixtures has
+the number redacted.
+
+Usage:
+  python3 scripts/probe_carrier_browser.py                  # fake numbers (page-load verdict)
+  python3 scripts/probe_carrier_browser.py --number ups=1Z... --number fedex=...
+  python3 scripts/probe_carrier_browser.py --carrier dhl --batch 3
+  python3 scripts/probe_carrier_browser.py --http-only      # skip Chrome entirely
+  python3 scripts/probe_carrier_browser.py --save-fixtures /tmp/carrier_fixtures
+
+Exit code 0 when at least one carrier came back usable, 1 when none did.
+"""
+import argparse
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import usps_browser as ub  # profile copy, UA, stealth, human pause, masking
+
+# The probe gets its OWN profile copy: the live bot's sweep may be running
+# against usps_browser's copy, and two Chrome sessions cannot share a
+# user_data_dir (SingletonLock). Probe-specific also means cleanup is ours.
+ub._PROFILE_COPY = os.path.expanduser("~/Library/Caches/carrier_probe_profile")
+
+# ── What we look for in a rendered page ───────────────────────────────────
+# A bare keyword is worthless here: "Delivered" is also the name of DHL's
+# customer magazine, and "Delivered To" is a UPS form label that renders even
+# when there is no shipment. So a status is only read from the RESULT AREA —
+# the slice of text that exists once the tracking widget has rendered.
+RESULT_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "ups": ("tracking details", "latest update", "shipment details", "received by"),
+    "fedex": ("local scan time", "track anothe", "shipment facts", "delivery status"),
+    "dhl": ("tracking history", "shipment details", "tracking result",
+            "estimated delivery", "status of your shipment"),
+}
+# An explicit "we don't know this number" answer IS an answer: it means the page
+# rendered a result area and the flow works. These are per-carrier on purpose —
+# a generic "not found" also matches a 404 page, which is how a probe talks
+# itself into believing a dead endpoint works.
+NO_RESULT_MARKERS: Dict[str, Tuple[str, ...]] = {
+    "ups": ("no information available", "no information for this tracking",
+            "please check your tracking number"),
+    "fedex": ("can’t be found", "can't be found", "cannot be found",
+              "may not be in our system yet", "please check with the shipper"),
+    # DHL is unproven (no result area rendered for a URL-param lookup yet), so
+    # these only serve a future flow that actually answers.
+    "dhl": ("no results", "no shipments found", "please check the number"),
+}
+STATUS_WORDS = (
+    "delivered", "out for delivery", "in transit", "on the way", "on its way",
+    "label created", "pre-shipment", "pre shipment", "awaiting item", "shipped",
+    "picked up", "arrived", "departed", "customs", "returned", "exception",
+    "delay", "held", "available for pickup",
+)
+# Bot-wall signatures. Seeing any of these means the browser tier is a NO-GO
+# without more work (a real browser profile + stealth is already the best shot).
+BLOCK_WORDS = (
+    "access denied", "captcha", "unusual traffic", "verify you are human",
+    "are you a robot", "pardon our interruption", "request blocked",
+    "reference #", "akamai", "perimeterx", "px-captcha", "incapsula",
+    "forbidden", "tracking attempt has been blocked", "rate limit",
+)
+
+# Fake numbers used when the caller supplies none: they exercise the full path
+# (page load, form handling, "not found" rendering) without touching anyone's
+# parcel — they only cannot prove a real STATUS parse.
+FAKE_NUMBERS = {
+    "ups": "1Z999AA10123456784",
+    "fedex": "999999999999",
+    "dhl": "9999999999",
+}
+
+# Plain-browser headers for the cheap HTTP leg: a real Chrome UA, no cookies
+# (the point is to learn what an anonymous client gets).
+HTTP_HEADERS = {
+    "User-Agent": ub.UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _mask_url(url: str, tid: str) -> str:
+    """Mask the tracking number inside a URL — printed URLs are output too."""
+    if tid and tid in url:
+        return url.replace(tid, ub._mask(tid))
+    return url
+
+
+def _hits(text: str, words: Tuple[str, ...]) -> List[str]:
+    low = text.lower()
+    return [w for w in words if w in low]
+
+
+def _zone(body: str, markers: Tuple[str, ...], window: int = 1500) -> str:
+    """The result area only: text from the first rendered-widget marker onward.
+    Nav and footer copy (which is where 'Delivered' as a brand name lives) is
+    deliberately excluded, because classifying that as a status is how a probe
+    lies to itself."""
+    low = body.lower()
+    for marker in markers:
+        idx = low.find(marker)
+        if idx >= 0:
+            return body[idx:idx + window]
+    return ""
+
+
+# ── Candidates: (label, method, url) ──────────────────────────────────────
+# JSON endpoints the tracking pages call themselves. Some are educated guesses
+# verified by this probe — a wrong guess costs one cheap request and is
+# reported as such, which is exactly what a probe is for.
+JSON_CANDIDATES: Dict[str, List[Tuple[str, str, str]]] = {
+    "ups": [
+        ("ups-json-getstatus", "POST",
+         "https://www.ups.com/track/api/Track/GetStatus?loc=en_US"),
+        ("ups-json-details", "GET",
+         "https://webapis.ups.com/track/v1/details/{tid}"),
+    ],
+    "fedex": [
+        ("fedex-json-v2", "GET",
+         "https://www.fedex.com/track/v2/tracknumbers/{tid}"
+         "?language=en&returnDetailed=true"),
+        ("fedex-json-alt", "GET",
+         "https://www.fedex.com/api/track/v1/trackingnumbers/{tid}"),
+    ],
+    "dhl": [
+        ("dhl-utapi", "GET",
+         "https://www.dhl.com/utapi?trackingNumber={tid}&language=en"),
+        ("dhl-utapi-express", "GET",
+         "https://www.dhl.com/utapi/express?trackingNumber={tid}&language=en"),
+    ],
+}
+
+# Public tracking pages, in the order worth trying: all three ship at least one
+# "the number is in the URL" entry point.
+HTML_CANDIDATES: Dict[str, List[Tuple[str, str]]] = {
+    "ups": [
+        ("ups-track", "https://www.ups.com/track?loc=en_US&tracknum={tid}"),
+        ("ups-trackdetails", "https://www.ups.com/trackdetails?tracknum={tid}"),
+    ],
+    "fedex": [
+        ("fedex-fedextrack", "https://www.fedex.com/fedextrack/?trknbr={tid}"),
+        ("fedex-wtrk", "https://www.fedex.com/wtrk/track/?trknbr={tid}"),
+        ("fedex-action",
+         "https://www.fedex.com/fedextrack/?action=track&tracknumbers={tid}&locale=en_US"),
+    ],
+    "dhl": [
+        ("dhl-global",
+         "https://www.dhl.com/global-en/home/tracking.html?tracking-id={tid}"),
+        ("dhl-us", "https://www.dhl.com/us-en/home/tracking.html?tracking-id={tid}"),
+        ("dhl-de-parcel",
+         "https://www.dhl.de/de/privatkunden/pakete-empfangen/verfolgen.html"
+         "?piececode={tid}"),
+    ],
+}
+
+# POST bodies for the JSON candidates that need one.
+JSON_BODIES = {
+    "ups-json-getstatus": lambda tid: {
+        "Locale": "en_US", "TrackingNumber": [tid],
+        "Requester": "wt/track", "returnScheduledDeliveryForNotDelivered": True,
+    },
+    "fedex-json-v2": lambda tid: {"trackingNumber": tid},
+    "fedex-json-alt": lambda tid: {"trackingNumbers": [tid]},
+}
+
+
+def probe_http(carrier: str, tid: str) -> List[dict]:
+    """The cheap leg: anonymous HTTP on the JSON endpoints, no browser."""
+    print(f"\n  [http] {carrier}: {ub._mask(tid)} — JSON endpoints, no browser")
+    out = []
+    with httpx.Client(timeout=20.0, follow_redirects=True) as client:
+        for label, method, template in JSON_CANDIDATES.get(carrier, []):
+            url = template.format(tid=tid)
+            body = JSON_BODIES.get(label)
+            try:
+                if method == "POST":
+                    resp = client.post(url, headers=HTTP_HEADERS,
+                                       json=body(tid) if body else None)
+                else:
+                    resp = client.get(url, headers=HTTP_HEADERS)
+            except Exception as e:
+                print(f"    {label:<20} → {type(e).__name__}: {e}")
+                out.append({"label": label, "usable": False, "error": str(e)})
+                continue
+            ctype = resp.headers.get("content-type", "")
+            kind = "JSON" if "json" in ctype.lower() else (resp.headers.get("content-type") or "?")
+            snippet = ""
+            parsed_ok = False
+            if "json" in ctype.lower():
+                try:
+                    payload = resp.json()
+                    parsed_ok = True
+                    snippet = json.dumps(payload)[:180]
+                except Exception:
+                    snippet = resp.text[:180]
+            else:
+                snippet = resp.text[:180].replace("\n", " ")
+            print(f"    {label:<20} → HTTP {resp.status_code}  {kind}  {len(resp.content)}b")
+            print(f"      {_mask_url(str(resp.url), tid)}")
+            if snippet:
+                print(f"      body: {snippet}")
+            out.append({"label": label, "usable": resp.status_code < 400 and parsed_ok,
+                        "status": resp.status_code, "json": parsed_ok,
+                        "url": str(resp.url), "body": snippet})
+            time.sleep(1.2)   # guests on someone else's API
+    return out
+
+
+def _launch(pw, profile_dir: str, headful: bool):
+    """One persistent context on the probe's own profile copy."""
+    return pw.chromium.launch_persistent_context(
+        user_data_dir=profile_dir,
+        headless=not headful,
+        executable_path=ub.CHROME_PATH,
+        user_agent=ub.UA,          # plain Chrome UA, never "HeadlessChrome"
+        locale="en-US",
+        viewport={"width": 1366, "height": 900},
+        args=["--disable-blink-features=AutomationControlled", "--disable-extensions"],
+    )
+
+
+def _recorder(page, tid: str) -> List[dict]:
+    """Collect the page's own XHRs — the JSON behind the DOM is the most stable
+    thing to parse later, so the probe dumps the URLs and a body excerpt."""
+    seen: List[dict] = []
+
+    def on_response(resp):
+        try:
+            ctype = (resp.headers or {}).get("content-type", "")
+        except Exception:
+            return
+        # Carrier API calls are kept even when non-JSON: an Akamai refusal on
+        # api.fedex.com comes back as text/html and would otherwise vanish.
+        is_api = "api.fedex.com" in (resp.url or "")
+        if "json" not in ctype.lower() and not is_api:
+            return
+        # playwright's sync Response exposes .status (httpx uses .status_code)
+        entry = {"url": _mask_url(resp.url, tid), "status": resp.status,
+                 "ctype": ctype, "body": ""}
+        try:
+            entry["body"] = json.dumps(resp.json())[:220]
+        except Exception:
+            pass
+        seen.append(entry)
+
+    page.on("response", on_response)
+    return seen
+
+
+def _settle(page, deadline_seconds: float, markers: Tuple[str, ...],
+            none_markers: Tuple[str, ...]) -> str:
+    """Poll the rendered body until the RESULT AREA appears (or the page says
+    'no such number', or a bot wall shows up), or the deadline runs out.
+    Returns the last body it saw. Waiting on the result area rather than on any
+    status word is what stops a nav string from ending the wait early."""
+    deadline = time.monotonic() + deadline_seconds
+    body = ""
+    while time.monotonic() < deadline:
+        time.sleep(1.2)
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            continue
+        if _hits(body, none_markers) or _hits(body, BLOCK_WORDS) \
+                or _zone(body, markers):
+            break
+    return body
+
+
+# Tracking SPAs that ignore the number in the URL only answer after the search
+# form is submitted (DHL's does). Typing the number and pressing Enter is the
+# same thing a person does, minus the typing.
+SEARCH_INPUTS: Dict[str, Tuple[str, ...]] = {
+    "dhl": ("input[name='tracking-id']", "input[id*='tracking' i]",
+            "input[aria-label*='tracking' i]", "input[placeholder*='tracking' i]",
+            "input[type='search']"),
+    "ups": ("input[id*='tracknum' i]", "input[name*='tracking' i]"),
+    "fedex": ("input[id*='tracking' i]", "input[name*='tracking' i]"),
+}
+SUBMIT_HINTS = ("button:has-text('Track')", "button[type='submit']",
+                "input[type='submit']", "a:has-text('Track')")
+
+
+def _report(carrier: str, label: str, body: str, doc_status, elapsed_ms: int,
+            title: str, xhrs: List[dict], tid: str,
+            save_dir: Optional[str]) -> dict:
+    """Classify one rendered page and return the evidence record. Shared by the
+    URL-param flow and the form-submit flow so both are judged identically."""
+    markers = RESULT_MARKERS.get(carrier, ())
+    zone = _zone(body, markers)
+    status_hits = _hits(zone, STATUS_WORDS)
+    none_hits = _hits(body, NO_RESULT_MARKERS.get(carrier, ()))
+    block_hits = _hits(body, BLOCK_WORDS)
+    json_xhr = [x for x in xhrs if x["status"] < 400]
+    # A status is only trustworthy when the result area actually mentions the
+    # number we searched. DHL's page matched our bogus number as a *reference*
+    # and rendered an unrelated freight shipment (housebill, container, weight)
+    # — showing that on a user's card would leak a stranger's parcel.
+    tid_in_zone = bool(tid) and tid.upper() in zone.upper()
+    if status_hits and tid_in_zone:
+        answer = "STATUS"
+    elif status_hits:
+        answer = "STATUS-UNVERIFIED"    # status text, but not provably ours
+    elif none_hits:
+        answer = "NOT-FOUND"        # a real answer, just a negative one
+    elif zone:
+        answer = "AREA-ONLY"        # widget rendered, told us nothing readable
+    else:
+        answer = "NOTHING"
+
+    print(f"      doc HTTP {doc_status}   {elapsed_ms} ms   body {len(body)} chars")
+    if title:
+        print(f"      title: {title}")
+    print(f"      result area  : {len(zone)} chars → {answer}")
+    print(f"      status words : {status_hits or 'none'}  (result area only)")
+    print(f"      our number in the result area: {'yes' if tid_in_zone else 'NO'}")
+    print(f"      no-result    : {none_hits or 'none'}")
+    if block_hits:
+        print(f"      ⚠ BOT WALL?  : {block_hits}")
+    print(f"      json XHRs    : {len(json_xhr)}")
+    for x in json_xhr[:4]:
+        print(f"        {x['status']} {x['url'][:110]}")
+        if x["body"]:
+            print(f"          {x['body'][:200]}")
+    api_calls = [x for x in xhrs if "api.fedex.com" in x["url"]]
+    if "fedex" in label.lower() or api_calls:
+        print(f"      api.fedex.com: {len(api_calls)} call(s)"
+              + ("  ← tracking API never called" if not any(
+                  "/track/" in x["url"] for x in api_calls) else ""))
+        for x in api_calls:
+            print(f"        {x['status']} {x['ctype'][:24]:24} {x['url'][:100]}")
+            if x["body"]:
+                print(f"          {x['body'][:160]}")
+    for x in xhrs[:6]:
+        if x not in json_xhr:
+            print(f"        (rejected) {x['status']} {x['url'][:110]}")
+
+    if save_dir and body:
+        try:
+            os.makedirs(save_dir, exist_ok=True)
+            path = os.path.join(save_dir, f"{carrier}_{label}.txt")
+            with open(path, "w") as fh:
+                fh.write(body.replace(tid, "<TID>"))   # redact before it hits disk
+            print(f"      fixture: {path}  (number redacted)")
+        except OSError as e:
+            print(f"      fixture save failed: {e}")
+
+    return {"label": label, "doc_status": doc_status, "answer": answer,
+            "answered": answer != "NOTHING", "readable": answer in ("STATUS", "NOT-FOUND"),
+            "status_hits": status_hits, "none_hits": none_hits, "zone_len": len(zone),
+            "blocked": bool(block_hits), "json_xhrs": len(json_xhr),
+            "ms": elapsed_ms, "body_len": len(body)}
+
+def probe_page(ctx, carrier: str, label: str, url: str, tid: str,
+               settle_seconds: float = 30.0,
+               save_dir: Optional[str] = None) -> dict:
+    """One tracking URL in one page: does a status render, and at what cost?"""
+    print(f"\n    [{label}] {_mask_url(url, tid)}")
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        page.add_init_script(ub._STEALTH)
+    except Exception:
+        pass
+    xhrs = _recorder(page, tid)
+    started = time.time()
+    doc_status = None
+    title = ""
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        doc_status = resp.status if resp else None
+    except Exception as e:
+        print(f"      goto failed: {type(e).__name__}: {e}")
+    body = _settle(page, settle_seconds, RESULT_MARKERS.get(carrier, ()),
+                   NO_RESULT_MARKERS.get(carrier, ()))
+    elapsed_ms = int((time.time() - started) * 1000)
+    try:
+        title = (page.title() or "")[:90]
+    except Exception:
+        pass
+
+    return _report(carrier, label, body, doc_status, elapsed_ms, title, xhrs, tid,
+                   save_dir)
+
+
+def probe_form(ctx, carrier: str, label: str, url: str, tid: str,
+               settle_seconds: float, save_dir: Optional[str]) -> dict:
+    """Submit the page's own search form instead of trusting the URL.
+
+    DHL's tracking SPA renders nothing for ?tracking-id=<number> — it only
+    answers a number typed into its search box — so the URL-param flow is not a
+    fair test of that carrier. Enter first, then the page's own Track button.
+    """
+    print(f"\n    [{label}] form submit on {url}")
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    try:
+        page.add_init_script(ub._STEALTH)
+    except Exception:
+        pass
+    xhrs = _recorder(page, tid)
+    started = time.time()
+    doc_status = None
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=45000)
+        doc_status = resp.status if resp else None
+    except Exception as e:
+        print(f"      goto failed: {type(e).__name__}: {e}")
+    time.sleep(2.0)   # let the SPA hydrate before looking for its input
+
+    matched = None
+    for selector in SEARCH_INPUTS.get(carrier, ()):
+        try:
+            if page.locator(selector).count():
+                page.fill(selector, tid)
+                matched = selector
+                break
+        except Exception:
+            continue
+    if not matched:
+        try:
+            body = page.inner_text("body")
+        except Exception:
+            body = ""
+        print(f"      no search input matched any of {SEARCH_INPUTS.get(carrier, ())}")
+        return _report(carrier, label, body, doc_status,
+                       int((time.time() - started) * 1000), "", xhrs, tid, save_dir)
+
+    print(f"      filled {matched} with {ub._mask(tid)}")
+    try:
+        page.keyboard.press("Enter")
+    except Exception:
+        pass
+    time.sleep(2.5)
+    try:
+        visible = page.inner_text("body")
+    except Exception:
+        visible = ""
+    if not _zone(visible, RESULT_MARKERS.get(carrier, ())):
+        # Enter did nothing visible: press the page's own Track button.
+        for selector in SUBMIT_HINTS:
+            try:
+                locator = page.locator(selector)
+                if locator.count():
+                    locator.first.click(timeout=5000)
+                    print(f"      clicked {selector}")
+                    break
+            except Exception:
+                continue
+
+    body = _settle(page, settle_seconds, RESULT_MARKERS.get(carrier, ()),
+                   NO_RESULT_MARKERS.get(carrier, ()))
+    try:
+        title = (page.title() or "")[:90]
+    except Exception:
+        title = ""
+    return _report(carrier, label, body, doc_status,
+                   int((time.time() - started) * 1000), title, xhrs, tid, save_dir)
+
+
+def probe_batch(ctx, carrier: str, tids: List[str], url_template: str,
+                settle_seconds: float, save_dir: Optional[str]) -> Tuple[int, int]:
+    """One session, several numbers. The bot serializes every browser session
+    (one Chrome user_data_dir), so a carrier that cannot be reused costs one
+    session per number — this is the measurement that decides `batch`."""
+    print(f"\n  [batch] {carrier}: {len(tids)} numbers in ONE session")
+    answered = 0
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    for idx, tid in enumerate(tids, 1):
+        res = probe_page(ctx, carrier, f"batch-{idx}", url_template.format(tid=tid),
+                         tid, settle_seconds, save_dir)
+        if res["answered"]:
+            answered += 1
+        if res["blocked"]:
+            print("      → bot wall mid-session: batching looks NOT viable here")
+            break
+        if idx < len(tids):
+            try:
+                ub._human_pause(page)
+            except Exception:
+                pass
+            time.sleep(2.0)
+    return answered, len(tids)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Can a headless browser read UPS/FedEx/DHL tracking pages?")
+    parser.add_argument("--carrier", action="append", default=[], metavar="SLUG",
+                        help="ups / fedex / dhl (repeatable; default: all three)")
+    parser.add_argument("--number", action="append", default=[], metavar="SLUG=TID",
+                        help="a REAL number for that carrier (repeatable; masked in output)")
+    parser.add_argument("--batch", type=int, default=1,
+                        help="numbers to try in ONE session (2+ tests batch viability)")
+    parser.add_argument("--http-only", action="store_true",
+                        help="only the cheap JSON HTTP leg — no Chrome")
+    parser.add_argument("--headful", action="store_true",
+                        help="show the window (for eyeballing a bot wall)")
+    parser.add_argument("--settle", type=float, default=30.0,
+                        help="seconds to wait for a rendered result, per URL")
+    parser.add_argument("--save-fixtures", metavar="DIR",
+                        help="save redacted page text for unit-test fixtures")
+    return parser.parse_args()
+
+
+def _verdict(http: List[dict], pages: List[dict], browser_tested: bool) -> str:
+    """One word per carrier, cheapest-useful-source first."""
+    if any(x.get("usable") for x in http):
+        return "GO-HTTP-JSON"
+    if not browser_tested:
+        # Saying NO-GO here would libel the carrier: the browser leg never ran.
+        return "HTTP-BLOCKED-UNTESTED"
+    if any(p["answer"] == "STATUS" for p in pages):
+        return "GO-BROWSER-STATUS"
+    if any(p["answer"] == "NOT-FOUND" for p in pages):
+        # The flow rendered a result area and answered definitively ("we can't
+        # find that number") — a real number should answer with a status.
+        return "GO-BROWSER-NOTFOUND"
+    if any(p["answer"] == "STATUS-UNVERIFIED" for p in pages):
+        # Status text appeared, but the searched number did not — most likely a
+        # reference/fuzzy match on someone else's shipment. Needs a real number
+        # (and an ownership check in the tier) before it can be trusted.
+        return "GO-BROWSER-SUSPECT"
+    if any(p["answer"] == "AREA-ONLY" for p in pages):
+        return "GO-BROWSER-WEAK"      # widget rendered but said nothing usable
+    if any(p["blocked"] for p in pages):
+        return "NO-GO-BLOCKED"
+    return "NO-GO-EMPTY"
+
+
+def main() -> int:
+    args = _parse_args()
+    # A carrier can have several numbers: batching is only proven by DISTINCT
+    # numbers rendering one after another in a single session.
+    numbers: Dict[str, List[str]] = {slug: [tid] for slug, tid in FAKE_NUMBERS.items()}
+    real: set = set()
+    for spec in args.number:
+        if "=" not in spec:
+            print(f"  ignoring --number {spec!r} (expected SLUG=TID)")
+            continue
+        slug, tid = spec.split("=", 1)
+        slug, tid = slug.strip().lower(), tid.strip()
+        if slug not in numbers:
+            numbers[slug] = []
+        elif slug not in real:
+            # First real number for this carrier: drop the fake placeholder,
+            # otherwise it would be probed as if it were one of ours (and UPS's
+            # public sample number renders a real status, so it would look real).
+            numbers[slug] = []
+        numbers[slug].append(tid)          # append: --number ups=A --number ups=B
+        real.add(slug)
+    wanted = args.carrier or ["ups", "fedex", "dhl"]
+
+    print("carrier browser probe — can a headless session read UPS/FedEx/DHL?")
+    print(f"  carriers : {', '.join(wanted)}")
+    for slug in wanted:
+        tids = numbers.get(slug) or []
+        print(f"  {slug:<8} : {len(tids)} number(s)"
+              + ("" if slug not in real else " (real)")
+              + ("" if slug in real else " (FAKE)"))
+    print(f"  mode     : {'HTTP only' if args.http_only else 'headful' if args.headful else 'headless Chrome'}")
+
+    verdicts: Dict[str, str] = {}
+    http_results: Dict[str, List[dict]] = {}
+    page_results: Dict[str, List[dict]] = {}
+    batch_results: Dict[str, Tuple[int, int]] = {}
+    batch_distinct: Dict[str, int] = {}
+
+    for carrier in wanted:
+        tids = numbers.get(carrier) or []
+        if not tids:
+            print(f"\n=== {carrier.upper()}: no number (skipped) ===")
+            continue
+        tid = tids[0]
+        print(f"\n=== {carrier.upper()} ({'real' if carrier in real else 'FAKE'} number) ===")
+        http_results[carrier] = probe_http(carrier, tid)
+        page_results[carrier] = []
+
+    if not args.http_only:
+        profile = ub._ensure_profile_copy()
+        if not profile:
+            print("\n  no Chrome profile copy available — browser legs skipped "
+                  "(need a real Chrome profile with a Cookies file)")
+        else:
+            print(f"\n  profile copy: {profile}")
+            try:
+                from playwright.sync_api import sync_playwright
+            except ImportError:
+                print("  playwright not installed (pip install playwright) — "
+                      "browser legs skipped")
+                sync_playwright = None
+            if sync_playwright:
+                with sync_playwright() as pw:
+                    for carrier in wanted:
+                        tids = numbers.get(carrier) or []
+                        if not tids:
+                            continue
+                        tid = tids[0]
+                        print(f"\n=== {carrier.upper()}: browser legs ===")
+                        ctx = _launch(pw, profile, args.headful)
+                        try:
+                            for label, template in HTML_CANDIDATES.get(carrier, []):
+                                page_results[carrier].append(probe_page(
+                                    ctx, carrier, label, template.format(tid=tid),
+                                    tid, args.settle, args.save_fixtures))
+                            if not any(p["answered"] for p in page_results[carrier]):
+                                # Every URL-param page rendered nothing. That is
+                                # NOT a verdict: SPAs that ignore the URL only
+                                # answer their own search form (DHL's does), so
+                                # try that before calling the carrier dead.
+                                label, template = HTML_CANDIDATES[carrier][0]
+                                page_results[carrier].append(probe_form(
+                                    ctx, carrier, f"{label}-form",
+                                    template.format(tid=tid), tid, args.settle,
+                                    args.save_fixtures))
+                            if args.batch >= 2:
+                                # Distinct numbers are what prove batching; one
+                                # number repeated only proves the session lives.
+                                pool = tids if len(tids) > 1 else [tid]
+                                repeats = -(-args.batch // len(pool))
+                                batch_tids = (pool * repeats)[:args.batch]
+                                batch_distinct[carrier] = len(pool)
+                                template = HTML_CANDIDATES[carrier][0][1]
+                                print(f"      batch pool: {len(pool)} distinct number(s)")
+                                batch_results[carrier] = probe_batch(
+                                    ctx, carrier, batch_tids, template, args.settle,
+                                    args.save_fixtures)
+                        finally:
+                            try:
+                                ctx.close()
+                            except Exception:
+                                pass
+
+    print("\nVERDICT")
+    for carrier in wanted:
+        if carrier not in http_results and carrier not in page_results:
+            continue
+        verdict = _verdict(http_results.get(carrier, []), page_results.get(carrier, []),
+                           browser_tested=not args.http_only)
+        verdicts[carrier] = verdict
+        pages = page_results.get(carrier, [])
+        # The most useful page is a readable one, fastest first; otherwise the
+        # quickest one that at least rendered something.
+        ranked = sorted([p for p in pages if p["readable"]]
+                        or [p for p in pages if p["answered"]] or pages,
+                        key=lambda p: p["ms"])
+        best = ranked[0] if ranked else None
+        json_xhrs = sum(p["json_xhrs"] for p in pages)
+        print(f"  {carrier:<6} {verdict:<20} pages {len(pages)}"
+              + (f", best: {best['answer']} on {best['label']} in {best['ms']} ms"
+                 if best else "")
+              + (f", json XHRs seen {json_xhrs}" if json_xhrs else ""))
+        if carrier in batch_results:
+            done, total = batch_results[carrier]
+            distinct = batch_distinct.get(carrier, 1)
+            print(f"         batch: {done}/{total} in one session → "
+                  f"session reuse {'works' if done == total and total > 1 else 'FAILED'}"
+                  + ("" if distinct > 1 else
+                     "  (same number repeated: pass distinct --number values to "
+                     "prove per-number rendering)"))
+    if not real:
+        print("\n  NOTE: these ran with fake numbers, so a rendered page can only "
+              "prove 'the page loads and shows not-found'. Re-run with "
+              "--number ups=... --number fedex=... --number dhl=... for a real "
+              "status verdict.")
+
+    ub.cleanup_profile_copy()   # privacy: the probe copy is disposable
+    usable = [c for c, v in verdicts.items() if v.startswith("GO")]
+    print(f"\nusable: {', '.join(usable) if usable else 'none'}")
+    return 0 if usable else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

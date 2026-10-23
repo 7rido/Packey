@@ -1,0 +1,13 @@
+--- a/tests/conftest.py	2026-10-04 23:22:45.339454879 +0000
++++ b/tests/conftest.py	2026-10-19 05:01:31.112013896 +0000
+@@ -53,6 +53,10 @@
+     monkeypatch.setattr(config, "DELIVERY_HISTORY_FILE",
+                         tmp_path / "delivery_history.json")
+     monkeypatch.setattr(config, "ADMIN_ALERTS", False)
++    # Per-chat notification settings (screens.py) live in a repo-root file too.
++    import screens
++    monkeypatch.setattr(screens, "_SETTINGS_FILE", str(tmp_path / "chat_settings.json"))
++    monkeypatch.setattr(screens, "_settings_cache", None)
+     # The tidy middleware's keep-input set is module state: one test marking a
+     # message as un-acted-on must not leak into a later test's deletion assertion.
+     monkeypatch.setattr(main, "_keep_input", set())
