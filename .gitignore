@@ -39,6 +39,20 @@ tracker.log.*
 # Debug capture dir (USPS_DEBUG_DIR) — masked page fixtures, still review before sharing
 dbg/
 
+# Pre-change backup snapshots (created by editing sessions)
+*.pre-*
+
+# Working artifacts from review/upgrade sessions
+_backup_before_screens/
+_screens_review/
+
 # macOS
 .DS_Store
 .fedex_cookies.txt
+
+# Internal planning docs
+EXTRACTION_PLAN.md
+
+# AI editor instruction files
+.clinerules/
+.muserules/
