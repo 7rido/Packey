@@ -457,10 +457,11 @@ def test_the_bot_token_path_is_redacted_from_logs():
     master credential: its path shape must redact like the capability URLs do
     (2026-10-04 audit)."""
     red = main._redact_text
+    _FAKE_TOKEN = "0000000000:AAFake_TestToken_NotReal_XXXXX"
     line = red("HTTP Request: POST https://api.telegram.org/"
-               "bot123456789:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw/sendMessage HTTP/1.1")
+               f"bot{_FAKE_TOKEN}/sendMessage HTTP/1.1")
     assert "/bot<redacted>/sendMessage" in line, "the token segment must be redacted"
-    assert "123456789:" not in line and "AAHdqTcv" not in line
+    assert "0000000000:" not in line and "AAFake" not in line
     # An ordinary path that merely contains "/bot" and no token shape survives.
     assert red("GET /bot/about HTTP/1.1") == "GET /bot/about HTTP/1.1"
     assert red("GET /bottling-plant HTTP/1.1") == "GET /bottling-plant HTTP/1.1"
